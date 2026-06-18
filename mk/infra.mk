@@ -3,9 +3,10 @@
 PYTHON := ./p_venv/bin/python
 MCP_HOST ?= 127.0.0.1
 MCP_PORT ?= 8000
+PROFILE ?= internal
 
 # ---- Phony ----
-.PHONY: infra.up infra.down infra.shell infra.build infra.fmt infra.lint infra.typecheck infra.check infra.repo.init infra.deps infra.coverage infra.clean infra.help infra.kb.build infra.mcp.run infra.mcp.run.sse infra.mcp.config
+.PHONY: infra.up infra.down infra.shell infra.build infra.fmt infra.lint infra.typecheck infra.check infra.repo.init infra.deps infra.coverage infra.clean infra.help infra.kb.gitmodules infra.kb.gitmodules.check infra.kb.build infra.mcp.run infra.mcp.run.sse infra.mcp.config
 
 # =============================================================================
 # Container Lifecycle Management
@@ -94,6 +95,14 @@ infra.mcp.config:
 	@sed "s|{{REPO_ROOT}}|$(shell pwd)|g" .mcp.json.tpl > .mcp.json
 	@echo ".mcp.json generated at $(shell pwd)"
 
+infra.kb.gitmodules:
+	@echo "--- Generating .gitmodules from knowledge.sources.yaml (profile: $(PROFILE)) ---"
+	@$(PYTHON) tools/generate_gitmodules.py --profile $(PROFILE)
+
+infra.kb.gitmodules.check:
+	@echo "--- Checking .gitmodules against knowledge.sources.yaml (profile: $(PROFILE)) ---"
+	@$(PYTHON) tools/generate_gitmodules.py --profile $(PROFILE) --check
+
 infra.kb.build:
 	@echo "--- Building knowledge base from ./source ---"
 	@$(PYTHON) make_source.py
@@ -130,6 +139,8 @@ infra.help:
 	@echo ""
 	@echo "Knowledge Base & MCP Server (uses ./p_venv, no Docker):"
 	@echo "  mcp.config          Generate .mcp.json with absolute paths for this repo."
+	@echo "  kb.gitmodules       Generate .gitmodules from knowledge.sources.yaml (PROFILE=internal|public)."
+	@echo "  kb.gitmodules.check Check .gitmodules matches knowledge.sources.yaml (CI drift check)."
 	@echo "  kb.build            Build the knowledge base from ./source (make_source.py)."
 	@echo "  mcp.run             Start the MCP server in stdio mode."
 	@echo "  mcp.run.sse         Start the MCP server in SSE/HTTP mode."

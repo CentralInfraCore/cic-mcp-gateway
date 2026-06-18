@@ -4,7 +4,7 @@
 include mk/infra.mk
 
 # ---- Phony ----
-.PHONY: all help validate release-check release-prepare release-close test up down shell build fmt lint check typecheck repo.init manifest-verify manifest-update kb.build mcp.run mcp.run.sse mcp.config
+.PHONY: all help validate release-check release-prepare release-close test up down shell build fmt lint check typecheck repo.init manifest-verify manifest-update kb.gitmodules kb.gitmodules.check kb.build mcp.run mcp.run.sse mcp.config
 
 # Default to showing help
 all: help
@@ -132,6 +132,8 @@ repo.init: infra.repo.init
 # Knowledge Base & MCP Server (p_venv based, no Docker)
 # =============================================================================
 
+kb.gitmodules: infra.kb.gitmodules
+kb.gitmodules.check: infra.kb.gitmodules.check
 kb.build: infra.kb.build
 mcp.run: infra.mcp.run
 mcp.run.sse: infra.mcp.run.sse
