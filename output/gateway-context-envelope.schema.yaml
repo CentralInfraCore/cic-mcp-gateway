@@ -1,0 +1,501 @@
+apiVersion: cic.gateway/v1
+kind: GatewayContextEnvelope
+metadata:
+  schema_id: "cic_mcp.gateway.context_envelope_contract"
+  status: experimental
+  created_at: "2026-06-22T00:00:00Z"
+  source_job: "gateway-context-envelope-contract-001"
+  description: >
+    Formal contract for the trust-marked context package that cic-mcp-gateway returns
+    on its agent-facing API. The gateway compiles this envelope from trust-domain
+    sources (cic-mcp-knowledge, cic-mcp-workdir, cic-mcp-session, cic-mcp-shared) — it
+    never returns a raw, un-enveloped source response to an agent. See dec-thead-0005:
+    "cic-mcp-gateway is a trust-domain aware context compiler, not a generic search
+    proxy." This envelope is the OUTPUT contract only; it does not define the source
+    registry (gateway-source-registry-contract-001) or any routing/adapter
+    implementation (gateway-session-adapter-contract-001 and successors).
+
+# ---------------------------------------------------------------------------
+# Invariants — these are NOT executable code, they are documented guarantees
+# that any future gateway implementation MUST uphold (architecture.md trust
+# model, CLAUDE.md trust model, acceptance-contract.md "Gateway-Specific
+# Contract"). A schema/JSON-Schema validator implementation is explicitly
+# OUT OF SCOPE for this job (see job input.md "Nem cél").
+# ---------------------------------------------------------------------------
+invariants:
+  - id: gateway-owns-no-raw-storage
+    statement: >
+      owns_raw_storage = false. The gateway itself never persists raw session
+      events, raw provider payloads, or any other raw source-layer data. Raw
+      storage is exclusively the responsibility of the source layers
+      (cic-mcp-session raw event store, cic-mcp-shared candidate memory store,
+      cic-mcp-knowledge canonical store). A GatewayContextEnvelope instance is
+      a transient, per-request compilation result, not a stored record of
+      truth.
+  - id: gateway-owns-no-embedding-store
+    statement: >
+      owns_embedding_store = false. The gateway does not maintain its own
+      vector index. Any vector/similarity retrieval happens inside a source
+      layer (e.g. cic-mcp-session's own vector search); the gateway only
+      consumes already-retrieved, already-ranked results from a source
+      adapter and wraps them into this envelope. gateway != vector store.
+  - id: gateway-does-not-create-truth
+    statement: >
+      The gateway never upgrades a trust level. A fact that enters from
+      cic-mcp-session as session_local/session_derived stays marked as such
+      inside session_derived_notes/trust_summary; it is never silently
+      promoted into canonical_facts by the gateway. Promotion to canonical
+      is exclusively a cic-mcp-knowledge review/promotion decision.
+  - id: gateway-route-query-not-search-all
+    statement: >
+      Constructing this envelope requires the gateway to have already
+      performed trust-domain source routing (query intent -> selected
+      source_id set) BEFORE compilation. An envelope produced by simply
+      querying every source unconditionally ("search_all") and concatenating
+      results is a forbidden shortcut, even if the output happens to satisfy
+      this schema structurally — see contract report "Invalid Envelope
+      Examples" #2.
+
+# ---------------------------------------------------------------------------
+# Top-level required fields
+# ---------------------------------------------------------------------------
+required:
+  - apiVersion
+  - kind
+  - envelope_id
+  - created_at
+  - query_intent
+  - scope
+  - answer_type
+  - sources_used
+  - trust_summary
+  - canonical_facts
+  - workdir_facts
+  - session_derived_notes
+  - shared_memory_notes
+  - conflicts
+  - proof_requirements
+  - refs
+
+properties:
+
+  apiVersion:
+    type: string
+    const: "cic.gateway/v1"
+    description: >
+      Envelope schema version. Consumers (agents/orchestrators) MUST reject
+      envelopes with an unrecognized apiVersion rather than guessing field
+      semantics — a future v2 may change field meaning, not just add fields.
+
+  kind:
+    type: string
+    const: "GatewayContextEnvelope"
+    description: >
+      Fixed discriminator. MUST always be exactly "GatewayContextEnvelope" —
+      there is no other kind value emitted by the gateway's agent-facing API.
+      This is also what structurally distinguishes a gateway response from a
+      raw, un-enveloped source response (see Forbidden Shortcuts: a raw
+      vector hit returned without this envelope is invalid by construction,
+      not just by convention).
+
+  # -------------------------------------------------------------------------
+  # Envelope identity
+  # -------------------------------------------------------------------------
+  envelope_id:
+    type: string
+    format: uuid
+    description: >
+      Globally unique identifier for this compiled envelope instance,
+      generated by the gateway at compile-time. Used for log/debug
+      correlation and for the agent to reference "the context I was given in
+      response X" in follow-up turns. Not an idempotency key — two identical
+      queries MAY legitimately produce two envelopes with different
+      envelope_id and different created_at, since source data may have
+      changed between requests.
+
+  created_at:
+    type: string
+    format: date-time
+    description: >
+      When the gateway compiled this envelope. RFC3339 UTC. Marks the
+      point-in-time validity of the envelope's content — sources_used and
+      trust_summary describe the state of the source layers as observed at
+      this timestamp, not a guarantee that hold true indefinitely.
+
+  # -------------------------------------------------------------------------
+  # Query framing — "honnan jott a kontextus" (where the context came from)
+  # -------------------------------------------------------------------------
+  query_intent:
+    type: string
+    minLength: 1
+    description: >
+      The gateway's recognized intent for the originating agent query (e.g.
+      "lookup-canonical-fact", "session-history-recall", "cross-session-
+      conflict-check"). REQUIRED — this is the output of the "query intent
+      felismerés" boundary responsibility (architecture.md "Fő határok",
+      Igen list) and is what drove trust-domain source routing for this
+      envelope. Free text at this schema revision; an intent taxonomy/enum
+      is left to a future gateway-query-intent-taxonomy job, not this one.
+
+  scope:
+    type: object
+    required: [scope_kind]
+    properties:
+      scope_kind:
+        type: string
+        enum: ["session", "cross_session", "repo", "global"]
+        description: >
+          ENUM, not free text. Declares the breadth the gateway routed this
+          query over: a single session, cross-session (shared layer),
+          a specific repo/workdir context, or global/canonical. Restricts
+          ambiguity about whether session-scope isolation (cic-mcp-session
+          default_scope: one session) was respected for this compilation.
+      session_id:
+        type: string
+        description: >
+          OPTIONAL. Present only when scope_kind = "session". The
+          cic-mcp-session session identifier this envelope was scoped to.
+      repo:
+        type: string
+        description: >
+          OPTIONAL. Present only when scope_kind = "repo". Identifies which
+          cic-mcp-workdir-tracked repo/worktree this envelope's workdir_facts
+          were drawn from.
+    description: >
+      Structural scope declaration for this envelope. REQUIRED object (not a
+      bare string) so that scope breadth is machine-checkable against the
+      content categories actually populated below (e.g. a scope_kind=
+      "session" envelope should not be the one carrying canonical_facts as
+      its primary content).
+
+  answer_type:
+    type: string
+    enum: ["fact_lookup", "history_recall", "conflict_report", "status_summary", "mixed"]
+    description: >
+      ENUM classification of what kind of answer this envelope represents,
+      from the doc-plan field list (docs/{hu,en}/architecture.md "Tervezett
+      adatfolyam"). Lets a consuming agent decide how much weight to give
+      trust_summary/conflicts before treating the content as actionable.
+
+  # -------------------------------------------------------------------------
+  # Source provenance — "honnan jott a kontextus"
+  # -------------------------------------------------------------------------
+  sources_used:
+    type: array
+    minItems: 0
+    items:
+      type: object
+      required: [source_id, trust_domain]
+      properties:
+        source_id:
+          type: string
+          enum: ["cic-mcp-session", "cic-mcp-shared", "cic-mcp-knowledge", "cic-mcp-workdir"]
+          description: >
+            Which registered source (gateway-baseline.md "Source Registry —
+            Initial Boundary") actually contributed to this envelope. ENUM
+            constrained to the four currently known source_id values; the
+            full source registry contract (field types, capabilities) is
+            defined by gateway-source-registry-contract-001, not here — this
+            schema only needs to reference source_id by value.
+        trust_domain:
+          type: string
+          enum: ["session_local", "session_derived", "shared_mixed", "canonical", "workdir_local"]
+          description: >
+            The trust domain this source was queried under for this
+            envelope, mirrored from the source registry at query time
+            (architecture.md "Trust modell"). Carried here (not just
+            implied by source_id) so a consumer can audit trust without
+            cross-referencing the registry.
+        query_capability_used:
+          type: string
+          description: >
+            OPTIONAL. Which query capability of the source was actually
+            invoked (e.g. "full_text", "vector", "timeline", "graph") —
+            useful for "Separation From Source-Specific MCP APIs" auditing:
+            this records THAT a capability was used, never the raw tool
+            response itself.
+      description: >
+        One entry per source actually consulted (not every registered
+        source — only those routed to for this specific query, per
+        "route_query != search_all").
+    description: >
+      REQUIRED. List of sources the gateway actually routed this query to.
+      MAY be an empty list only in the degenerate case of an envelope that
+      carries zero source-derived content (e.g. a pure proof_requirements-
+      only response) — in the normal case this list is non-empty and
+      directly explains the non-empty content fields below.
+
+  # -------------------------------------------------------------------------
+  # Content — "mi a tartalom" — explicitly partitioned by source-layer
+  # origin, NOT a single "facts" field with a trust tag. The origin is
+  # structural, not metadata (see job input.md "Feladat" 1 + Forbidden
+  # Shortcuts #3).
+  # -------------------------------------------------------------------------
+  canonical_facts:
+    type: array
+    items:
+      type: object
+      required: [content, ref]
+      properties:
+        content:
+          type: string
+          description: Reviewed/promoted canonical statement, verbatim or minimally normalized.
+        ref:
+          type: string
+          description: Reference into refs[] (see below) proving provenance for this fact.
+    description: >
+      REQUIRED (MAY be an empty array). Content sourced exclusively from
+      cic-mcp-knowledge (architecture_summary.knowledge_layer: "reviewed and
+      promoted canonical knowledge"; trust model: canonical = true only
+      after review/promotion). The gateway MUST NOT place content from any
+      other source into this field, regardless of how confident that
+      source's own data looks — canonical status is earned upstream by
+      cic-mcp-knowledge's own review/promotion flow, never assigned by the
+      gateway at compile time.
+
+  workdir_facts:
+    type: array
+    items:
+      type: object
+      required: [content, ref]
+      properties:
+        content:
+          type: string
+          description: A fact about current repo/worktree/branch/diff state.
+        ref:
+          type: string
+          description: Reference into refs[] (e.g. "repo:branch:path:line").
+    description: >
+      REQUIRED (MAY be an empty array). Content sourced from cic-mcp-workdir
+      (current repo/worktree/branch/diff state — role currently filled by
+      cic-factory, per docs/architecture.md component map). Kept structurally
+      separate from canonical_facts because workdir state is mutable,
+      local-machine/branch-scoped, and not reviewed — mixing it into
+      canonical_facts would silently launder unreviewed state into the
+      canonical-looking field.
+
+  session_derived_notes:
+    type: array
+    items:
+      type: object
+      required: [content, trust, ref]
+      properties:
+        content:
+          type: string
+          description: A note/observation derived from session-scope data.
+        trust:
+          type: string
+          enum: ["session_local", "session_derived"]
+          description: >
+            Mirrors cic-mcp-session's own trust vocabulary (architecture.md
+            trust model: session.trust = session_local / session_derived).
+            MUST NOT use "canonical" or "reviewed_shared" here — those
+            belong to other trust domains.
+        ref:
+          type: string
+          description: Reference into refs[] (e.g. session_id + chunk/turn id).
+    description: >
+      REQUIRED (MAY be an empty array). Content sourced from cic-mcp-session
+      (session-scope event/timeline/chunk/retrieval data). Kept separate from
+      shared_memory_notes because session data defaults to single-session
+      scope (cic-mcp-session "default scope: one session") — collapsing it
+      into a cross-session field would erase that scope boundary.
+
+  shared_memory_notes:
+    type: array
+    items:
+      type: object
+      required: [content, trust, ref]
+      properties:
+        content:
+          type: string
+          description: A note/observation derived from cross-session shared memory.
+        trust:
+          type: string
+          enum: ["mixed", "candidate", "reviewed_shared"]
+          description: >
+            Mirrors cic-mcp-shared's own trust vocabulary (architecture.md
+            trust model: shared.trust = mixed / candidate / reviewed_shared).
+            MUST NOT use "canonical" here — shared content is "not canonical
+            by default" even when reviewed_shared.
+        ref:
+          type: string
+          description: Reference into refs[] (e.g. cluster_id, candidate_memory_id).
+    description: >
+      REQUIRED (MAY be an empty array). Content sourced from cic-mcp-shared
+      (cross-session aggregation, weighting, conflict/superseded candidates).
+      Kept separate from session_derived_notes because shared content has
+      already crossed the single-session boundary and carries a different
+      trust vocabulary and a different (lower, until reviewed_shared)
+      default confidence than raw session data.
+
+  # -------------------------------------------------------------------------
+  # Trust marking — "milyen trust-jeloles van rajta"
+  # -------------------------------------------------------------------------
+  trust_summary:
+    type: object
+    required: [overall_confidence, per_category]
+    properties:
+      overall_confidence:
+        type: string
+        enum: ["high", "medium", "low", "unverified"]
+        description: >
+          The gateway's own compiled-envelope-level confidence summary. This
+          is a SUMMARY judgment over the categories below, not a new trust
+          assertion the gateway invents independently of its sources — it
+          MUST be derivable from per_category (e.g. presence of any "low" or
+          "unverified" entry caps overall_confidence accordingly).
+      per_category:
+        type: object
+        required: [canonical_facts, workdir_facts, session_derived_notes, shared_memory_notes]
+        properties:
+          canonical_facts:
+            type: string
+            enum: ["high", "medium", "low", "unverified", "not_used"]
+          workdir_facts:
+            type: string
+            enum: ["high", "medium", "low", "unverified", "not_used"]
+          session_derived_notes:
+            type: string
+            enum: ["high", "medium", "low", "unverified", "not_used"]
+          shared_memory_notes:
+            type: string
+            enum: ["high", "medium", "low", "unverified", "not_used"]
+        description: >
+          Per-content-category confidence, mirroring the same 4-way
+          partition as the content fields above. "not_used" MUST be set for
+          a category whose corresponding content array is empty — this
+          keeps trust_summary and content-field population mutually
+          consistent and auditable.
+    description: >
+      REQUIRED object (not a free-text string). Summarizes the trust level
+      of the content actually included in this envelope, broken down per
+      content category so a consumer does not have to infer trust from
+      source_id alone (architecture.md "Trust modell" + job input.md
+      "trust_summary — a tartalom trust-szintjének összefoglalása").
+
+  conflicts:
+    type: array
+    minItems: 0
+    items:
+      type: object
+      required: [description, conflicting_refs]
+      properties:
+        description:
+          type: string
+          description: Human-readable description of the disagreement between sources.
+        conflicting_refs:
+          type: array
+          minItems: 2
+          items:
+            type: string
+          description: At least two refs (into refs[]) that disagree with each other.
+        severity:
+          type: string
+          enum: ["informational", "needs_review", "blocking"]
+          description: OPTIONAL. How urgently this conflict should be surfaced to the agent/human.
+    description: >
+      REQUIRED field, MAY be an empty array — but the field itself MUST
+      NEVER be absent from an envelope (job input.md / Forbidden Shortcuts:
+      "a conflicts mező hianyzik teljesen, nem csak ures lista" is an
+      explicitly forbidden shortcut). An empty array is the gateway's
+      explicit positive claim "no known cross-source conflict was detected
+      for this query," which is a different, stronger statement than simply
+      omitting the field.
+
+  proof_requirements:
+    type: array
+    minItems: 0
+    items:
+      type: object
+      required: [description]
+      properties:
+        description:
+          type: string
+          description: What must still be verified before this content can be treated as canonical truth.
+        blocking_for:
+          type: array
+          items:
+            type: string
+          description: OPTIONAL. Which refs/content items this proof requirement applies to.
+    description: >
+      REQUIRED field, MAY be an empty array — same "explicit empty, never
+      absent" rule as conflicts. An empty array is the positive claim "this
+      envelope's content needs no further verification before being treated
+      as canonical," distinct from omitting the field entirely.
+
+  # -------------------------------------------------------------------------
+  # Evidence references
+  # -------------------------------------------------------------------------
+  refs:
+    type: array
+    minItems: 0
+    items:
+      type: object
+      required: [ref_id, source_id]
+      properties:
+        ref_id:
+          type: string
+          description: >
+            Opaque locator into the originating source (e.g. a
+            cic-mcp-knowledge chunk_id, a cic-mcp-session session_id +
+            turn/chunk id, a cic-mcp-shared cluster_id/candidate_memory_id,
+            or a workdir "repo:branch:path:line" string).
+        source_id:
+          type: string
+          enum: ["cic-mcp-session", "cic-mcp-shared", "cic-mcp-knowledge", "cic-mcp-workdir"]
+          description: Which source this ref resolves against.
+        excerpt:
+          type: string
+          description: OPTIONAL short excerpt/snippet for human-readable display, not the full payload.
+    description: >
+      REQUIRED (MAY be an empty array only in a degenerate proof_requirements
+      -only envelope). Every entry in canonical_facts/workdir_facts/
+      session_derived_notes/shared_memory_notes/conflicts/proof_requirements
+      that carries a `ref` or `conflicting_refs`/`blocking_for` value MUST
+      resolve to an entry in this array — refs is the single evidence
+      table the rest of the envelope points into, so provenance is never
+      asserted without a resolvable locator.
+
+# ---------------------------------------------------------------------------
+# Forbidden combinations — validation rules (explicit, not just documentation)
+# Restating these at schema-doc level per the cic-mcp-session style
+# convention; NO runtime/validator code is implied or implemented by this.
+# ---------------------------------------------------------------------------
+forbidden_combinations:
+  - id: forbidden-missing-conflicts-field
+    rule: "conflicts is absent (undefined), as opposed to conflicts == []"
+    enforcement: "conflicts is listed in top-level `required` — schema-level rejection of an envelope that omits the key entirely."
+    rationale: >
+      job input.md Forbidden Shortcuts: treating conflicts as optional loses
+      the gateway's positive "no conflict detected" claim and silently
+      collapses "not checked" into "no conflict," which is a trust
+      regression, not a neutral omission.
+  - id: forbidden-missing-proof-requirements-field
+    rule: "proof_requirements is absent (undefined), as opposed to proof_requirements == []"
+    enforcement: "proof_requirements is listed in top-level `required`."
+    rationale: >
+      Same rationale as forbidden-missing-conflicts-field, applied to
+      proof_requirements.
+  - id: forbidden-merged-facts-field
+    rule: "a single `facts` array carrying a per-item trust tag instead of canonical_facts/workdir_facts/session_derived_notes/shared_memory_notes"
+    enforcement: "schema defines four distinct required properties; there is no `facts` property at all."
+    rationale: >
+      job input.md: source-layer origin is structural, not metadata — a
+      merged facts+trust-tag field would let a single field silently mix
+      canonical and session-local content, which collapses exactly the
+      trust-domain boundary this envelope exists to preserve.
+  - id: forbidden-canonical-promotion-by-gateway
+    rule: "an item appears in canonical_facts whose corresponding ref.source_id is not cic-mcp-knowledge"
+    enforcement: "documented invariant (gateway-does-not-create-truth); not machine-enforced by this schema revision, since cross-field ref/source_id consistency checking requires a validator implementation, which is explicitly out of scope for this job (see Nem cél)."
+    rationale: >
+      The gateway must never promote session/shared/workdir content into
+      canonical_facts — canonical status is earned exclusively via
+      cic-mcp-knowledge's own review/promotion flow.
+  - id: forbidden-raw-source-passthrough
+    rule: "an envelope-shaped object exists whose content fields are populated but sources_used/trust_summary were not genuinely derived from a routed query (e.g. all sources queried unconditionally, or a raw MCP tool response copied in verbatim)"
+    enforcement: "documented invariant (gateway-route-query-not-search-all); not machine-enforced by this schema revision — detecting this requires runtime routing-decision evidence, not just structural validation."
+    rationale: >
+      route_query != search_all. A structurally valid envelope produced by
+      querying everything and pasting results in defeats the purpose of
+      query-intent-driven routing; see contract report Invalid Example #2.
