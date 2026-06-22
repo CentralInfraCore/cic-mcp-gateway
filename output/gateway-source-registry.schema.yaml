@@ -1,0 +1,192 @@
+apiVersion: cic.gateway/v1
+kind: GatewaySourceRegistryEntry
+metadata:
+  schema_id: "cic_mcp.gateway.source_registry_contract"
+  status: experimental
+  created_at: "2026-06-22T00:00:00Z"
+  source_job: "gateway-source-registry-contract-001"
+  description: >
+    Formal contract for a single entry in the cic-mcp-gateway source registry —
+    the registered belépési pont (entry point) the gateway uses to know WHICH
+    trust-domain layers it may route a query to, and what each layer can/cannot
+    do. This schema describes ONE registry entry; the registry itself is a list
+    of entries (one per known source_id). This is the missing contract referenced
+    by gateway-context-envelope.schema.yaml's sources_used[].source_id
+    description: "the full source registry contract (field types, capabilities)
+    is defined by gateway-source-registry-contract-001, not here." This job
+    formalizes exactly that. NO registry loader/validator implementation is
+    provided or implied — see job input.md "Nem cél".
+
+# ---------------------------------------------------------------------------
+# Invariants — documented guarantees only, NOT executable code. Mirrors the
+# gateway-context-envelope.schema.yaml convention (invariants block, no
+# runtime/validator implication).
+# ---------------------------------------------------------------------------
+invariants:
+  - id: registry-source-id-enum-locked-to-envelope-contract
+    statement: >
+      source_id and trust_domain in this schema MUST use exactly the same enum
+      value sets as gateway-context-envelope.schema.yaml's
+      sources_used[].source_id / sources_used[].trust_domain. This schema does
+      not introduce new source_id or trust_domain values independently — see
+      "Enum Sync Check" in the contract report for the side-by-side proof. Any
+      future addition to either enum requires a coordinated patch to BOTH
+      schema files, not a silent divergence.
+  - id: registry-entry-is-not-gateway-self-entry
+    statement: >
+      The registry never contains an entry describing the gateway itself
+      (source_id = a gateway-owned identifier). The gateway is the consumer of
+      this registry, not a member of it — owns_raw_storage/returns_trust_envelope
+      describe the SOURCE layer's own properties, never the gateway's. A
+      registry entry with owns_raw_storage: true asserting it is the gateway's
+      own storage would violate gateway-owns-no-raw-storage (architecture.md
+      trust model) — see "Invalid Registry Entries" #2 in the contract report.
+  - id: registry-canonical-true-only-for-knowledge-layer
+    statement: >
+      canonical: true MUST only be set for the cic-mcp-knowledge source_id, per
+      gateway-baseline.md "Source Registry — Initial Boundary" ("canonical | bool
+      | a forrás tartalma canonical-e (alapból csak cic-mcp-knowledge review
+      után)"). No other source_id may legitimately claim canonical: true in this
+      schema revision, since canonical status is earned exclusively through
+      cic-mcp-knowledge's own review/promotion flow (gateway-does-not-create-truth
+      invariant, gateway-context-envelope.schema.yaml).
+
+# ---------------------------------------------------------------------------
+# Top-level required fields (per registry entry)
+# ---------------------------------------------------------------------------
+required:
+  - source_id
+  - trust_domain
+  - owns_raw_storage
+  - returns_trust_envelope
+  - query_capabilities
+  - canonical
+
+properties:
+
+  source_id:
+    type: string
+    enum: ["cic-mcp-session", "cic-mcp-shared", "cic-mcp-knowledge", "cic-mcp-workdir"]
+    description: >
+      Unique identifier for this registered source. ENUM LOCKED to exactly the
+      same 4 values as gateway-context-envelope.schema.yaml
+      properties.sources_used.items.properties.source_id.enum — see "Enum Sync
+      Check" in the contract report for the verbatim grep evidence both schemas
+      were checked against. The gateway itself is never a valid value here (see
+      invariant registry-entry-is-not-gateway-self-entry).
+
+  trust_domain:
+    type: string
+    enum: ["session_local", "session_derived", "shared_mixed", "canonical", "workdir_local"]
+    description: >
+      The trust domain this source operates under. ENUM LOCKED to exactly the
+      same 5 values as gateway-context-envelope.schema.yaml
+      properties.sources_used.items.properties.trust_domain.enum — see "Enum
+      Sync Check". This is the registry-level declaration; an individual
+      sources_used[] entry in a compiled envelope mirrors this value at query
+      time (gateway-context-envelope.schema.yaml trust_domain description:
+      "mirrored from the source registry at query time").
+
+  owns_raw_storage:
+    type: boolean
+    description: >
+      Whether the SOURCE layer itself (not the gateway) persists raw data —
+      e.g. cic-mcp-session owns its own raw event store, cic-mcp-knowledge owns
+      its own canonical store. This is a property of the source, and is allowed
+      to be true for a source entry. It must NEVER be read as a statement about
+      the gateway's own storage — the gateway's owns_raw_storage is always false
+      and is declared once in the gateway's own trust model (architecture.md),
+      not per registry entry.
+
+  returns_trust_envelope:
+    type: boolean
+    description: >
+      Whether the source's own native query API already returns a trust-marked
+      response (true), or returns a raw/native response that the gateway itself
+      must wrap into trust-marked content before it can appear in a
+      GatewayContextEnvelope content field (false). This does not change
+      whether the gateway constructs a GatewayContextEnvelope (it always does)
+      — it only affects how much trust-wrapping work the gateway's (future)
+      adapter for that source must perform.
+
+  query_capabilities:
+    type: array
+    minItems: 1
+    items:
+      type: string
+    description: >
+      Which query types this source can serve, e.g. "full_text", "vector",
+      "timeline", "graph". Mirrors gateway-context-envelope.schema.yaml's
+      sources_used[].query_capability_used (OPTIONAL, single value actually
+      invoked for one query) — query_capabilities here is the source's full
+      declared capability SET at registry level, not a per-query record. A
+      query_capability_used value recorded in a compiled envelope MUST be a
+      member of the corresponding registry entry's query_capabilities list;
+      this cross-schema consistency rule is documented here but NOT
+      machine-enforced by this schema revision (no validator implementation —
+      see job input.md "Nem cél").
+
+  canonical:
+    type: boolean
+    description: >
+      Whether this source's content is canonical by default. Per
+      gateway-baseline.md "Source Registry — Initial Boundary": canonical is
+      true only for cic-mcp-knowledge after review/promotion; all other
+      sources default to false (session/shared/workdir content is never
+      silently canonical, regardless of how confident it looks — see invariant
+      registry-canonical-true-only-for-knowledge-layer and
+      gateway-context-envelope.schema.yaml's
+      forbidden-canonical-promotion-by-gateway rule, which this registry-level
+      field directly supports).
+
+# ---------------------------------------------------------------------------
+# Forbidden combinations — validation rules (explicit, documented; NO
+# runtime/validator code implied or implemented). Mirrors the
+# gateway-context-envelope.schema.yaml forbidden_combinations convention.
+# ---------------------------------------------------------------------------
+forbidden_combinations:
+  - id: forbidden-missing-trust-domain
+    rule: "a registry entry declares source_id without trust_domain"
+    enforcement: "trust_domain is listed in top-level `required` — schema-level rejection of an entry that omits the key entirely."
+    rationale: >
+      Every registered source must declare its trust domain so the gateway can
+      decide routing and so a compiled envelope's sources_used[].trust_domain
+      has a registry-level value to mirror; an entry without trust_domain is
+      unusable for trust-domain source routing (architecture.md "Fő határok",
+      Igen list).
+  - id: forbidden-non-knowledge-canonical-true
+    rule: "canonical: true on a registry entry whose source_id is not cic-mcp-knowledge"
+    enforcement: "documented invariant (registry-canonical-true-only-for-knowledge-layer); not machine-enforced by this schema revision, since cross-field source_id/canonical consistency checking requires a validator implementation, which is explicitly out of scope for this job (see Nem cél)."
+    rationale: >
+      canonical status is earned exclusively via cic-mcp-knowledge's own
+      review/promotion flow (gateway-does-not-create-truth invariant). A
+      registry entry asserting canonical: true for any other source_id would
+      let the gateway treat unreviewed content as canonical at the registry
+      level, before any query even happens — a stronger and earlier violation
+      than the per-envelope forbidden-canonical-promotion-by-gateway rule.
+  - id: forbidden-gateway-self-entry
+    rule: "a registry entry whose source_id refers to the gateway itself, or sets owns_raw_storage: true while implying it describes the gateway's own storage"
+    enforcement: "documented invariant (registry-entry-is-not-gateway-self-entry); not machine-enforced — source_id is enum-constrained to the 4 known source values, none of which name the gateway, but a future enum addition could re-introduce this risk without a validator."
+    rationale: >
+      The gateway is the registry's consumer, not a member of it
+      (owns_raw_storage: false, owns_embedding_store: false per the gateway's
+      own trust model in architecture.md) — registering the gateway as one of
+      its own sources would be a structural category error.
+  - id: forbidden-empty-query-capabilities
+    rule: "query_capabilities is an empty list"
+    enforcement: "properties.query_capabilities declares minItems: 1."
+    rationale: >
+      A registered source with zero query capabilities cannot be routed to for
+      any query intent, making the entry meaningless as a routing target — if
+      a source temporarily has no usable capability it should be removed from
+      the registry, not kept with an empty capability list.
+  - id: forbidden-source-id-trust-domain-enum-drift
+    rule: "this schema's source_id or trust_domain enum diverges from gateway-context-envelope.schema.yaml's sources_used[].source_id / sources_used[].trust_domain enum, without an explicit coordinated patch note"
+    enforcement: "documented invariant (registry-source-id-enum-locked-to-envelope-contract); enforced today only by the side-by-side grep comparison performed in the contract report's Enum Sync Check, not by automated cross-schema validation."
+    rationale: >
+      gateway-context-envelope.schema.yaml's source_id description explicitly
+      defers the full source registry contract to this job; if this schema's
+      enum silently diverged from the envelope schema's enum, the two
+      contracts would describe two different worlds for the same field, and
+      compiled envelopes could reference a source_id this registry does not
+      recognize, or vice versa.
