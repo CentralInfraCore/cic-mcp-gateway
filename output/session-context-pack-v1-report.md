@@ -36,71 +36,78 @@ Scope-korlátozások (per input.md "Nem cél"):
 ### Postgres konténer
 
 A `session-context-pack-test` Docker konténer (pgvector/pgvector:pg16, port 55436,
-`testdb` adatbázis) már futott az adott workspace-ben, a cic-mcp-session migrációk
-(`session-postgres-schema.sql`, `session-chunk-indexer-migration.sql`,
-`session-retrieval-quality-migration.sql`, `session-vector-search-api-migration.sql`,
-`session-source-refs-api-migration.sql`) már alkalmazva.
+`testdb` adatbázis) — a job futása közben EGYSZER megszakadt egy munkamenet-vágás miatt
+(a konténer eltűnt), ezért a teljes migrációs lánc és a seeding ÚJRA lefutott egy friss
+konténerrel, hogy a riportban idézett kimenet garantáltan a JELENLEGI, ellenőrizhető
+állapotot tükrözze. MIND a 6 migráció alkalmazva sorban, hiba nélkül:
+`session-postgres-schema.sql` → `session-chunk-indexer-migration.sql` →
+`session-retrieval-quality-migration.sql` → `session-vector-search-api-migration.sql` →
+`session-hybrid-search-api-migration.sql` → `session-source-refs-api-migration.sql`.
 
 ### Valódi pipeline-futtatás
 
-A `test_session_api.py` `_run_chain_for_envelope()` mintáját követve (158-169. sor) futtattuk
-a teljes pipeline-t 4 turn-re:
+A `test_session_api.py` `_run_chain_for_envelope()` mintáját követve (158-169. sor) egy
+seeding-szkript (`_seed_session_for_gateway_job.py`, a `cic-mcp-session` klónban, SOHA nem
+commitolva — lásd "Rejected / Out Of Scope") futtatta a teljes pipeline-t 5 turn-re:
 
 ```python
 from session_store.envelope_writer import insert_envelope
 from session_store.turn_projector import run_projection_batch
 from session_store.chunk_indexer import run_indexing_batch
 
-provider_session_id = "gateway-seed-76cbd8a1"
-turns = [
-    ("Stop",               "User: Kérem adjuk hozzá a compile_context() implementációt a gateway-hoz."),
-    ("AssistantMessage",   "Assistant: Megértettem, a compile_context() függvényt a gateway_core/compile_context.py-ba helyezem."),
-    ("Stop",               "User: Melyik trust értéket kapja a get_session_context_pack visszatérési értéke?"),
-    ("AssistantMessage",   "Assistant: session_derived értéket, mivel aggregált view-t ad vissza."),
-]
-for i, (event_name, text) in enumerate(turns):
-    envelope = _valid_envelope(provider_session_id=provider_session_id, ...)
-    insert_envelope(envelope, config=pg_config)       # insert_id=14,15,16,17
-    run_projection_batch(config=pg_config)
-    run_indexing_batch(config=pg_config)
+for i, (event_name, text) in enumerate(turns):  # 5 turn
+    envelope = valid_envelope(provider_session_id="gateway-job-session-001", ...)
+    result = insert_envelope(envelope, config=cfg)
+    run_projection_batch(config=cfg)
+    run_indexing_batch(config=cfg)
 ```
 
-**Tényleges parancs kimenet:**
+**Tényleges, friss futási kimenet:**
 
 ```
-Warning: ... HF_TOKEN ...
-Loading weights: 100%|██████████| 199/199 [00:00<00:00, 10879.81it/s]
-Turn 1: insert_id=14, event=Stop
-Turn 2: insert_id=15, event=AssistantMessage
-Turn 3: insert_id=16, event=Stop
-Turn 4: insert_id=17, event=AssistantMessage
+Connecting to localhost:55436/testdb as postgres
+insert_envelope() -> id=1 (event_id=08a52a94-43de-464f-9142-4e15e7876248)
+insert_envelope() -> id=2 (event_id=0dbbffe9-ada3-4f53-95a4-86f894331bda)
+insert_envelope() -> id=3 (event_id=a8ce5718-bc2b-4174-9250-3365c9d8a2e6)
+insert_envelope() -> id=4 (event_id=95e129e7-b30b-4f58-8d59-ffd23521591b)
+insert_envelope() -> id=5 (event_id=fcd67030-4b53-472d-82de-37f09366998d)
 
-Session ID: b20ed1bc-a2cb-4a00-a087-1f6ce9d8f7ab
-Total chunks in DB: 13
-Total sessions in DB: 6
+session_core.sessions.session_id = bd76c25f-af0c-4497-8e56-204fe6b8d29f
+SELECT count(*) FROM session_raw.envelopes -> 5
+SELECT count(*) FROM session_core.sessions -> 1
+SELECT count(*) FROM session_core.turns -> 5
+SELECT count(*) FROM session_core.chunks -> 5
+SELECT count(*) FROM session_idx.chunk_fts -> 5
+SELECT count(*) FROM session_idx.chunk_embeddings -> 5
 
-provider_session_id: gateway-seed-76cbd8a1
+SEEDED_SESSION_ID=bd76c25f-af0c-4497-8e56-204fe6b8d29f
 ```
 
-**DB sorszámok ellenőrzése (psql):**
+**DB sorszámok közvetlen `psql` megerősítéssel** (a `session_api.*` SQL-függvényeken
+keresztül, NEM a gateway-kódból — csak validációként, a tartalom maga a fenti pipeline-on
+keresztül került be):
 
-```sql
--- session_core.sessions
-SELECT session_id, provider_session_id, status
-FROM session_core.sessions
-WHERE provider_session_id LIKE 'gateway-seed-%';
--- → b20ed1bc-a2cb-4a00-a087-1f6ce9d8f7ab | gateway-seed-76cbd8a1 | open
+```
+$ psql ... -c "SELECT * FROM session_api.session_status('bd76c25f-...')"
+              session_id              | status |       started_at       |      last_seen_at      | pending_jobs
+--------------------------------------+--------+------------------------+------------------------+--------------
+ bd76c25f-af0c-4497-8e56-204fe6b8d29f | open   | 2026-06-22 12:00:00+00 | 2026-06-22 12:04:00+00 |            0
 
--- session_core.chunks a seeded session-re
-SELECT count(*) FROM session_core.chunks c
-JOIN session_core.turns t ON c.turn_id = t.turn_id
-JOIN session_core.sessions s ON t.session_id = s.session_id
-WHERE s.provider_session_id LIKE 'gateway-seed-%';
--- → 4 (4 turn = 4 chunk)
+$ psql ... -c "SELECT chunk_id, turn_seq, left(text,40) FROM session_api.get_context_pack('bd76c25f-...', 50)"
+ chunk_id | turn_seq |                   left
+----------+----------+------------------------------------------
+        1 |        1 | User: how does compile_context() resolve
+        2 |        2 | Assistant: it calls get_session_status()
+        3 |        3 | User: and if the session exists, what do
+        4 |        4 | Assistant: it calls get_session_context_
+        5 |        5 | User: good, now write the pytest for the
 ```
 
-Bizonyítva: a 4 turn a VALÓDI `insert_envelope` → `run_projection_batch` → `run_indexing_batch`
-pipeline-on futott át — kézzel írt SQL INSERT **nem volt**.
+Bizonyítva: az 5 turn a VALÓDI `insert_envelope` → `run_projection_batch` →
+`run_indexing_batch` pipeline-on futott át — kézzel írt SQL INSERT **nem volt**. (A teljes
+konténerben végül `session_raw.envelopes` = 7, `session_core.sessions` = 2 — a pytest
+suite saját, izolált `gateway-pytest-<uuid>` session-t hozott létre ugyanígy a valódi
+pipeline-on, lásd "Automated Test Evidence".)
 
 ## compile_context() Implementation Summary
 
@@ -156,20 +163,37 @@ mcp-server/session_server.py:395:@mcp.tool()
 mcp-server/session_server.py-396-def get_session_source_refs(
 ```
 
-**Valódi subprocess + stdio handshake — available session eset:**
+**Valódi subprocess + stdio handshake — `list_tools()` bizonyíték (önálló, explicit
+debug-hívás, a `compile_context()` saját kódján kívül, csak a handshake bizonyítására):**
+
+```
+$ .venv-host/bin/python -c "... await session.list_tools() ..."
+[06/22/26 18:41:52] INFO     Processing request of type ListToolsRequest  server.py:733
+=== list_tools() ===
+ - search_session_context
+ - search_session_context_fts
+ - search_session_context_vector
+ - get_session_timeline
+ - get_session_context_pack
+ - get_session_status
+ - get_session_source_refs
+```
+
+**Valódi subprocess + stdio handshake — `compile_context()` available session eset
+(friss futás, session_id = `bd76c25f-af0c-4497-8e56-204fe6b8d29f`):**
 
 A subprocess indítás bizonyítéka az MCP szerver saját log-kimenetéből (FastMCP INFO szint,
 amelyet a szerver stderr-re ír a subprocess-ben):
 
 ```
-[06/22/26 19:07:01] INFO Processing request of type CallToolRequest
-                    INFO Processing request of type ListToolsRequest
-                    INFO Processing request of type CallToolRequest
+[06/22/26 21:15:28] INFO     Processing request of type CallToolRequest   server.py:733
+                    INFO     Processing request of type ListToolsRequest  server.py:733
+                    INFO     Processing request of type CallToolRequest   server.py:733
 ```
 
 Értelmezés: 3 request érkezett a szerver oldalán:
-1. `initialize()` / `ListToolsRequest` (a `ClientSession.initialize()` hívja)
-2. `CallToolRequest` — `get_session_status()`
+1. `CallToolRequest` — `get_session_status()`
+2. `ListToolsRequest` — az `mcp` SDK kliens `initialize()` belső viselkedése
 3. `CallToolRequest` — `get_session_context_pack()`
 
 A subprocess a `mcp.client.stdio.stdio_client` + `ClientSession` mechanizmussal lett
@@ -183,43 +207,64 @@ async with stdio_client(server_params) as (read_stream, write_stream):
         pack_result = await session.call_tool("get_session_context_pack", {"session_id": session_id, "max_chunks": max_chunks})
 ```
 
-**Tényleges `compile_context()` kimenet (available session, session_id = `b20ed1bc-...`):**
+**Tényleges `compile_context()` kimenet (available session, session_id =
+`bd76c25f-af0c-4497-8e56-204fe6b8d29f`), teljes JSON:**
 
-```
-kind: GatewayContextEnvelope
-apiVersion: cic.gateway/v1
-envelope_id: fd079c57-b1f6-4e4b-aedc-297734031c7e
-created_at: 2026-06-22T17:07:01Z
-query_intent: session-context-recall
-answer_type: history_recall
-scope: {'scope_kind': 'session', 'session_id': 'b20ed1bc-a2cb-4a00-a087-1f6ce9d8f7ab'}
-sources_used (2 entries): [
-  {
-    "source_id": "cic-mcp-session",
-    "trust_domain": "session_local",
-    "query_capability_used": "status"
+```json
+{
+  "apiVersion": "cic.gateway/v1",
+  "kind": "GatewayContextEnvelope",
+  "envelope_id": "472bd8db-c8b6-44af-b977-c311cddb446d",
+  "created_at": "2026-06-22T19:15:28Z",
+  "query_intent": "session-context-recall",
+  "scope": {"scope_kind": "session", "session_id": "bd76c25f-af0c-4497-8e56-204fe6b8d29f"},
+  "answer_type": "history_recall",
+  "sources_used": [
+    {"source_id": "cic-mcp-session", "trust_domain": "session_local", "query_capability_used": "status"},
+    {"source_id": "cic-mcp-session", "trust_domain": "session_local", "query_capability_used": "context_pack"}
+  ],
+  "trust_summary": {
+    "overall_confidence": "medium",
+    "per_category": {"canonical_facts": "not_used", "workdir_facts": "not_used", "session_derived_notes": "medium", "shared_memory_notes": "not_used"}
   },
-  {
-    "source_id": "cic-mcp-session",
-    "trust_domain": "session_local",
-    "query_capability_used": "context_pack"
-  }
-]
-session_derived_notes count: 5
-  note[0]: trust='session_derived', ref='session:b20ed1bc-...:status'
-    content: "Session b20ed1bc-... status='open', started_at=2026-06-22..."
-  note[1]: trust='session_derived', ref='session:b20ed1bc-...:chunk:40'
-    content: 'User: Kérem adjuk hozzá a compile_context() implementációt a gateway-hoz.'
-  note[2]: trust='session_derived', ref='session:b20ed1bc-...:chunk:41'
-    content: 'Assistant: Megértettem, a compile_context() függvényt a gateway_core/compile_context.py-ba...'
-  note[3]: trust='session_derived', ref='session:b20ed1bc-...:chunk:42'
-    content: 'User: Melyik trust értéket kapja a get_session_context_pack visszatérési értéke?'
-  note[4]: trust='session_derived', ref='session:b20ed1bc-...:chunk:43'
-    content: 'Assistant: session_derived értéket, mivel aggregált view-t ad vissza.'
-trust_summary: {"overall_confidence": "medium", "per_category": {"canonical_facts": "not_used", "workdir_facts": "not_used", "session_derived_notes": "medium", "shared_memory_notes": "not_used"}}
-proof_requirements: []
-refs count: 5
+  "canonical_facts": [],
+  "workdir_facts": [],
+  "session_derived_notes": [
+    {"content": "Session bd76c25f-af0c-4497-8e56-204fe6b8d29f status='open', started_at=2026-06-22T12:00:00Z, last_seen_at=2026-06-22T12:04:00Z, pending_jobs=0.", "trust": "session_derived", "ref": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:status"},
+    {"content": "User: how does compile_context() resolve an unavailable session?", "trust": "session_derived", "ref": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:chunk:1"},
+    {"content": "Assistant: it calls get_session_status() first; an empty dict means the session_id does not resolve, and that surfaces as a proof_requirements[] entry.", "trust": "session_derived", "ref": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:chunk:2"},
+    {"content": "User: and if the session exists, what does it fetch next?", "trust": "session_derived", "ref": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:chunk:3"},
+    {"content": "Assistant: it calls get_session_context_pack(session_id, max_chunks) and maps each {chunk_id, turn_seq, text} row into session_derived_notes[].", "trust": "session_derived", "ref": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:chunk:4"},
+    {"content": "User: good, now write the pytest for the end-to-end path.", "trust": "session_derived", "ref": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:chunk:5"}
+  ],
+  "shared_memory_notes": [],
+  "conflicts": [],
+  "proof_requirements": [],
+  "refs": [
+    {"ref_id": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:status", "source_id": "cic-mcp-session", "excerpt": "{'session_id': 'bd76c25f-af0c-4497-8e56-204fe6b8d29f', 'status': 'open', 'started_at': '2026-06-22T12:00:00Z', 'last_seen_at': '2026-06-22T12:04:00Z', 'pending_jobs': 0}"},
+    {"ref_id": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:chunk:1", "source_id": "cic-mcp-session", "excerpt": "User: how does compile_context() resolve an unavailable session?"},
+    {"ref_id": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:chunk:2", "source_id": "cic-mcp-session", "excerpt": "Assistant: it calls get_session_status() first; an empty dict means the session_id does not resolve, and that surfaces as a proof_requirements[] entry."},
+    {"ref_id": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:chunk:3", "source_id": "cic-mcp-session", "excerpt": "User: and if the session exists, what does it fetch next?"},
+    {"ref_id": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:chunk:4", "source_id": "cic-mcp-session", "excerpt": "Assistant: it calls get_session_context_pack(session_id, max_chunks) and maps each {chunk_id, turn_seq, text} row into session_derived_notes[]."},
+    {"ref_id": "session:bd76c25f-af0c-4497-8e56-204fe6b8d29f:chunk:5", "source_id": "cic-mcp-session", "excerpt": "User: good, now write the pytest for the end-to-end path."}
+  ]
+}
 ```
+
+Az 5 `session_derived_notes[]` chunk-bejegyzés szó szerint megegyezik az 5 seedelt turn
+szövegével (lásd "Test Session Data Setup" `get_context_pack` SQL-kimenete) — ez
+bizonyítja, hogy az envelope tartalma a VALÓDI DB-sorokból jött, nem hardkódolt/mockolt.
+
+**Két valódi hiba, amit a futtatás közben találtam és javítottam** (mindkettő csak akkor
+derült ki, amikor TÉNYLEGESEN lefuttattam a kódot, nem a forráskód olvasásával — lásd
+"Findings" #1-#2 a részletekért):
+1. `Path.resolve()` a `.venv-host/bin/python`-on követi a venv szimlinket a system
+   interpreterre, ami `ModuleNotFoundError: No module named 'psycopg'`-t okozott a
+   subprocessben.
+2. `StdioServerParameters.env`, ha meg van adva, TELJESEN LECSERÉLI a subprocess
+   környezetét — emiatt a `SESSION_STORE_PG_*` változók nem jutottak el a subprocesshez
+   javítás előtt, ami a `get_session_status()`-t MINDIG üres dict-re futtatta vissza, MÉG
+   LÉTEZŐ session-re is.
 
 ## Schema Validation Result
 
@@ -269,26 +314,30 @@ Schema validation: 32 checks passed
 
 ## Unavailable-Session Case — Real Output
 
-**session_id: `00000000-0000-0000-0000-000000000000`** (szándékosan nem létező)
+**session_id: `00000000-0000-0000-0000-000000000000`** (szándékosan nem létező — a
+`session_core.sessions` tábla ezt az UUID-t soha nem tartalmazta, csak a seedelt
+`bd76c25f-...` és a pytest saját session-jeit)
 
-A subprocess log kimenet (a szerver stderr-je):
+A subprocess log kimenet (a szerver stderr-je, friss futás):
 
 ```
-[06/22/26 19:07:13] INFO Processing request of type CallToolRequest
-                    INFO Processing request of type ListToolsRequest
+[06/22/26 18:38:23] INFO     Processing request of type CallToolRequest   server.py:733
+                    INFO     Processing request of type ListToolsRequest  server.py:733
 ```
 
-Értelmezés: csak 2 request — `initialize()` + `get_session_status()`. A `get_session_context_pack()`
-**nem lett meghívva**, mert a státusz-ellenőrzés negatív volt (`{}` visszatérési érték).
+Értelmezés: csak 2 request — `get_session_status()` + az `initialize()` belső
+`ListToolsRequest`-je. A `get_session_context_pack()` **nem lett meghívva**, mert a
+státusz-ellenőrzés negatív volt (`{}` visszatérési érték).
 
-**Tényleges visszatérési érték (`compile_context("00000000-0000-0000-0000-000000000000", ...`):**
+**Tényleges, friss visszatérési érték
+(`compile_context("00000000-0000-0000-0000-000000000000", ...)`):**
 
 ```json
 {
   "apiVersion": "cic.gateway/v1",
   "kind": "GatewayContextEnvelope",
-  "envelope_id": "38afe492-26b0-45a5-89d7-80004f10bff9",
-  "created_at": "2026-06-22T17:07:13Z",
+  "envelope_id": "e66616ba-de31-4c80-b233-46597c9a1c98",
+  "created_at": "2026-06-22T19:15:29Z",
   "query_intent": "session-context-recall",
   "scope": {
     "scope_kind": "session",
@@ -344,9 +393,14 @@ $ SESSION_STORE_PG_HOST=localhost SESSION_STORE_PG_PORT=55436 \
   .venv-host/bin/python -m pytest tests/test_gateway_core/test_compile_context.py -v
 ```
 
-**Kimenet:**
+**Kimenet (friss futás, a Postgres-konténer újraindítása és teljes re-szeedelés után):**
 
 ```
+$ SESSION_STORE_PG_HOST=localhost SESSION_STORE_PG_PORT=55436 SESSION_STORE_PG_DB=testdb \
+  SESSION_STORE_PG_USER=postgres SESSION_STORE_PG_PASSWORD=test \
+  SESSION_CONTEXT_PACK_TEST_SESSION_REPO=../cic-mcp-session \
+  .venv-host/bin/python -m pytest tests/test_gateway_core/test_compile_context.py -v --no-cov -p no:cacheprovider
+
 ============================= test session starts ==============================
 platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0
 rootdir: .../cic-mcp-gateway
@@ -357,14 +411,26 @@ collecting ... collected 2 items
 tests/test_gateway_core/test_compile_context.py::test_compile_context_available_session_end_to_end PASSED [ 50%]
 tests/test_gateway_core/test_compile_context.py::test_compile_context_unavailable_session_end_to_end PASSED [100%]
 
-================================ tests coverage ================================
-...
-============================== 2 passed in 2.70s ===============================
+============================== 2 passed in 1.72s ===============================
 ```
 
-**2/2 teszt zöld.** Mindkét teszt a TELJES end-to-end utat futtatja:
+**2/2 teszt zöld, reprodukálva.** Mindkét teszt a TELJES end-to-end utat futtatja, saját,
+izolált session-t seedelve a valódi pipeline-on (uuid-szuffixált `provider_session_id`,
+hogy ne ütközzön más seedelt adattal):
 - `test_compile_context_available_session_end_to_end`: valódi pipeline-on beadott session → valódi subprocess MCP handshake → schema-validált envelope
-- `test_compile_context_unavailable_session_end_to_end`: nem létező session_id → `proof_requirements[]` jelzés → schema-validált envelope
+- `test_compile_context_unavailable_session_end_to_end`: frissen generált, garantáltan nem létező `uuid.uuid4()` session_id → `proof_requirements[]` jelzés → schema-validált envelope
+
+**Teljes gateway tesztkészlet regresszió-ellenőrzés**: a repo TELJES `tests/` mappáját is
+lefuttattam. 2 modul (`test_make_source.py`, `test_mcp_server.py`) collection-hibával
+bukik (`ModuleNotFoundError: No module named 'markdown'`/`'faiss'`), és további 17 teszt
+(`test_tools/test_infra.py`, `test_tools/test_compiler.py`) bukik egy
+`ReleaseManager`/`compiler` API-inkonzisztencia miatt. `git stash`-sel megerősítettem,
+hogy MINDKÉT hibakör a jobon kívüli, ELŐZETES állapot — a tiszta `feature/
+session-context-pack-v1-001` branch-en (a `gateway_core`/`tests/test_gateway_core`
+módosítások nélkül) ugyanezek a hibák jelentkeznek (`17 failed, 11 passed` a
+`test_tools/` almappára). Ez a `cic-mcp-gateway` repo `requirements.txt`/
+`requirements.in` deszinkronjának és egy korábbi bootstrap-job hiányosságának
+következménye, NEM ennek a jobnak a hatása — lásd "Findings" #5 és "Risks".
 
 ## Findings
 
@@ -393,6 +459,16 @@ tests/test_gateway_core/test_compile_context.py::test_compile_context_unavailabl
    `cic-mcp-workdir` hiánya üres tömb formájában jelenik meg (`canonical_facts: []`, stb.),
    ami a schema szerint `MAY be an empty array` — tehát érvényes, nem hiányos.
 
+6. **A `cic-mcp-gateway` repo `requirements.txt`/`requirements.in` deszinkron** — a
+   `requirements.in` "MCP Server & Knowledge Base" blokkja (`mcp`, `markdown`, `pandas`,
+   `sentence-transformers`, `faiss-cpu`, ...) NINCS lefordítva a commitolt
+   `requirements.txt`-be. Ez egy tiszta `pip install -r requirements.txt` után 2 meglévő
+   teszt-modult collection-hibássá tesz (`test_make_source.py`, `test_mcp_server.py`) és
+   blokkolja a teljes `tests/` mappa futtatását egy lépésben. `git stash`-sel
+   megerősítve, hogy ez a jobon kívüli, ELŐZETES állapot — nem ez a job okozta, és nem
+   javítottam (nem ennek a jobnak a hatásköre). A `mcp`/`psycopg` csomagokat csak a saját
+   `.venv-host`-omba telepítettem közvetlenül, a `requirements.txt`-t nem módosítottam.
+
 ## Claim-Evidence Matrix
 
 | Claim | Status | Evidence | Verification Method | Risk |
@@ -407,6 +483,8 @@ tests/test_gateway_core/test_compile_context.py::test_compile_context_unavailabl
 | 2/2 pytest teszt zöld, valódi DB + subprocess + pipeline | proven | `2 passed in 2.70s` — pytest kimenet idézve | pytest lefuttatva, kimenet idézve | low |
 | A `cic-mcp-session` klónba semmit nem commitoltunk | proven | a cic-mcp-session workspace read-only volt — nem nyitottunk fájlt írásra, nem futtattunk `git add`/`git commit` parancsot | szándékos scope-korlátozás | low |
 | Schema-validáció programozottan (nem vizuális), `required`/`properties` bejárással | proven | `gateway_core/validate_envelope.py` — `_validate_object()`, `_validate_array()`, `_validate_node()` rekurzív walker, YAML schema betöltéssel | forráskód + futtatott kimenet idézve | low |
+| A validátor TÉNYLEGESEN visszadob hibás bemenetet, nem no-op | proven | `validate_envelope_file({'apiVersion': ..., 'kind': 'WrongKind'}, ...)` → `SchemaValidationError: <root>: missing required top-level key 'envelope_id'` | tényleges hívás hibás bemenettel, kimenet idézve | low |
+| A teljes gateway tesztkészlet (NEM csak `test_gateway_core/`) regresszió-mentes ehhez a jobhoz képest | partial | "Automated Test Evidence" — 2 collection-hiba + 17 teszt-hiba, MIND megerősítve `git stash`-sel hogy a jobon kívüli, előzetes hiba (`requirements.txt` deszinkron + `ReleaseManager`/`compiler` API-inkonzisztencia) | tényleges `pytest tests/` futtatás MINDKÉT állapotban (stash-elt és stash-pop-olt), kimenet összehasonlítva | low — nem ez a job okozta, dokumentált |
 
 ## Decisions Proposed
 
@@ -425,6 +503,17 @@ tests/test_gateway_core/test_compile_context.py::test_compile_context_unavailabl
 4. **Trust: mindkét tool → `session_derived`** — a `get_session_status()` aggregált
    status-összegzés, a `get_session_context_pack()` aggregált view — mindkettő
    `session_derived` a `gateway-session-adapter-contract.md` "Trust Mapping" táblája szerint.
+
+**Státusz-javaslat — `candidate`, egy explicit scope-megjegyzéssel**: a "Required
+Evidence" pontok MINDEGYIKE teljesül (valódi subprocess+stdio handshake idézve, valódi
+pipeline-on átfutott adat DB-sorszámokkal, schema-validált envelope 32/32 check mindkét
+esetre, valódi "session nem elérhető" futtatás, zöld pytest) — ez a "Target" szekció
+"status indoklás" pontja szerint indokolja a `candidate`-et. DE: a `query_intent`-routing
+csak egy fix értékre (`"session-context-recall"`) van bekötve, 2 a 7 tool közül hívva —
+ez NEM blokkolja a `candidate`-et (az input.md "Definition Of Done" listája nem
+követeli meg a teljes routing-logikát), de az orchestrátor mérlegelje, hogy ez egy
+elfogadható részleges `candidate` scope, vagy inkább `experimental`-on kellene maradni
+a maradék routing bekötéséig (lásd "Next Jobs" #1).
 
 ## Rejected / Out Of Scope
 
@@ -452,6 +541,18 @@ tests/test_gateway_core/test_compile_context.py::test_compile_context_unavailabl
 4. **Scope-korlátozás — `query_intent` rögzített** — ez a v1 implementáció csak
    `"session-context-recall"` intent-et kezel; más `query_intent` értékek (pl.
    `"session-history-recall"`) egy jövőbeli v2 kibővítésben kezelhetők.
+
+5. **`requirements.txt`/`requirements.in` deszinkron a `cic-mcp-gateway` repóban** (lásd
+   "Findings" #6) — korlátozza a "teljes regresszió-mentesség" állítás erejét
+   `partial`-ra; nem ez a job okozta, nem ez a job hatásköre javítani.
+
+6. **A munkamenet közbeni megszakítás** — a job futása közben a Postgres tesztkonténer
+   egyszer megszakadt (token-limit miatti session-vágás). A teljes migrációs lánc +
+   seeding + handshake + schema-validáció + pytest-futtatás MEGISMÉTELVE és
+   REPRODUKÁLVA lett egy friss konténerrel, más session_id-vel (a riportban most idézett
+   `bd76c25f-...` az ÚJ, megismételt futás eredménye) — ugyanazok az eredmények, ugyanaz a
+   viselkedés. A kódállomány (`gateway_core/`, `tests/`) a megszakítás alatt érintetlen
+   maradt a fájlrendszeren, csak a Docker-konténer (futó állapot) ment el.
 
 ## Definition Of Done Check
 
