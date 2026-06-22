@@ -202,6 +202,22 @@ def test_compile_context_available_session_end_to_end(session_repo_root, seeded_
     assert len(envelope["session_derived_notes"]) >= 1
     assert all(note["trust"] in ("session_local", "session_derived") for note in envelope["session_derived_notes"])
 
+    # Hardened assertion (gateway-compile-context-test-hardening-001): the
+    # generic ">= 1" check above is satisfied even when get_session_context_pack()
+    # silently returns zero chunks (e.g. chunk_indexer swallowed a
+    # ModuleNotFoundError for sentence-transformers and rolled back the
+    # transaction) — the get_session_status() summary note alone is always
+    # >= 1. Require AT LEAST ONE note that is actually derived from the
+    # context pack's chunk content (ref containing ":chunk:"), so the test
+    # fails loudly if the real pipeline silently degraded to status-only.
+    chunk_refs = [n for n in envelope["session_derived_notes"] if ":chunk:" in n["ref"]]
+    assert len(chunk_refs) >= 1, (
+        "context_pack tartalom hiányzik a session_derived_notes[]-ból — "
+        "csak a get_session_status() összegző note van jelen, a valódi "
+        "chunk-eredetű tartalom hiányzik (lásd gateway-compile-context-"
+        "test-hardening-001 input.md)"
+    )
+
     schema_path = GATEWAY_REPO_ROOT / "output" / "gateway-context-envelope.schema.yaml"
     checks = validate_envelope_file(envelope, schema_path)
     assert len(checks) > 0
