@@ -10,7 +10,7 @@
       }
     },
     "cic-gateway": {
-      "command": "{{REPO_ROOT}}/p_venv/bin/python",
+      "command": "{{REPO_ROOT}}/.venv-host/bin/python",
       "args": [
         "{{REPO_ROOT}}/mcp-server/gateway_server.py"
       ],
