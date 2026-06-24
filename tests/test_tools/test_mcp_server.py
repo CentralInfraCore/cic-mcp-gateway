@@ -200,3 +200,107 @@ class TestSearchTokenFallback:
         with patch.object(mcp_server, "load_kb", return_value=kb):
             results = mcp_server.search_token("xyznotaword", top_k=3)
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# write-confinement — update_companion / record_decision
+#
+# Security regression tests for cic-mcp-gateway-mcp-write-confinement-fix-001:
+# both functions used to accept a client-supplied absolute file_path /
+# companion_path and write to it with ZERO SOURCE_DIR-containment check.
+# These tests prove BOTH that a path escaping SOURCE_DIR is now refused
+# (and the target file is left untouched) AND that the legitimate,
+# SOURCE_DIR-confined use case still succeeds (no regression).
+# ---------------------------------------------------------------------------
+
+class TestResolveWithinSourceDir:
+    def test_path_inside_source_dir_resolves(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp_server, "SOURCE_DIR", tmp_path)
+        resolved = mcp_server._resolve_within_source_dir("foo.yaml")
+        assert resolved == (tmp_path / "foo.yaml").resolve()
+
+    def test_path_escaping_source_dir_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp_server, "SOURCE_DIR", tmp_path)
+        with pytest.raises(ValueError):
+            mcp_server._resolve_within_source_dir("/etc/passwd")
+
+    def test_dotdot_escape_raises(self, tmp_path, monkeypatch):
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        monkeypatch.setattr(mcp_server, "SOURCE_DIR", source_dir)
+        with pytest.raises(ValueError):
+            mcp_server._resolve_within_source_dir("../outside.yaml")
+
+
+class TestUpdateCompanionWriteConfinement:
+    def test_rejects_path_outside_source_dir_no_write(self, tmp_path, monkeypatch):
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        monkeypatch.setattr(mcp_server, "SOURCE_DIR", source_dir)
+
+        outside = tmp_path / "outside.yaml"
+        outside.write_text("description: original-untouched-content\n")
+
+        result = mcp_server.update_companion(
+            file_path=str(outside), description="SHOULD BE REFUSED"
+        )
+
+        assert result["success"] is False
+        assert "escapes SOURCE_DIR" in result["message"]
+        assert outside.read_text() == "description: original-untouched-content\n"
+
+    def test_legit_companion_inside_source_dir_still_updates(self, tmp_path, monkeypatch):
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        monkeypatch.setattr(mcp_server, "SOURCE_DIR", source_dir)
+
+        companion = source_dir / "legit_companion.yaml"
+        companion.write_text("description: ''\n")
+
+        result = mcp_server.update_companion(
+            file_path="legit_companion.yaml", description="legit update should succeed"
+        )
+
+        assert result["success"] is True
+        assert "description" in result["updated_fields"]
+        assert "legit update should succeed" in companion.read_text()
+
+
+class TestRecordDecisionWriteConfinement:
+    def test_rejects_path_outside_source_dir_no_write(self, tmp_path, monkeypatch):
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        monkeypatch.setattr(mcp_server, "SOURCE_DIR", source_dir)
+
+        outside = tmp_path / "outside_decision.yaml"
+        outside.write_text("agent_decisions: []\n")
+
+        with patch.object(mcp_server, "load_kb", return_value={"nodes": {}}):
+            result = mcp_server.record_decision(
+                node_id="poc-node",
+                decision="SHOULD BE REFUSED",
+                companion_path=str(outside),
+            )
+
+        assert result["success"] is False
+        assert "escapes SOURCE_DIR" in result["message"]
+        assert outside.read_text() == "agent_decisions: []\n"
+
+    def test_legit_companion_inside_source_dir_still_updates(self, tmp_path, monkeypatch):
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        monkeypatch.setattr(mcp_server, "SOURCE_DIR", source_dir)
+
+        companion = source_dir / "legit_companion2.yaml"
+        companion.write_text("agent_decisions: []\n")
+
+        with patch.object(mcp_server, "load_kb", return_value={"nodes": {}}):
+            result = mcp_server.record_decision(
+                node_id="poc-node",
+                decision="legit decision should succeed",
+                companion_path="legit_companion2.yaml",
+            )
+
+        assert result["success"] is True
+        assert "Decision recorded" in result["message"]
+        assert "legit decision should succeed" in companion.read_text()

@@ -1167,6 +1167,35 @@ def guided_path(topic: str, max_steps: int = 10) -> dict:
 SOURCE_DIR = Path(os.environ.get("SOURCE_DIR", str(BASE_DIR / "source")))
 
 
+def _resolve_within_source_dir(file_path: str) -> Path:
+    """Build an absolute path the same way callers historically did (absolute
+    stays absolute, relative is joined to SOURCE_DIR), then verify with
+    Path.resolve() + Path.is_relative_to() that the result is actually
+    confined to SOURCE_DIR.
+
+    This is a write-confinement guard: MCP-tool functions that accept a
+    client-supplied file_path/companion_path and later open() it for writing
+    must call this FIRST and refuse on ValueError, before any open() attempt.
+
+    Raises:
+        ValueError: if the resolved path escapes SOURCE_DIR (including via
+            symlinks or '..' segments — resolved, not string-prefix checked).
+    """
+    p = Path(file_path)
+    if not p.is_absolute():
+        p = SOURCE_DIR / file_path
+
+    resolved = p.resolve()
+    resolved_source_dir = SOURCE_DIR.resolve()
+
+    if not resolved.is_relative_to(resolved_source_dir):
+        raise ValueError(
+            f"path escapes SOURCE_DIR, refused: {resolved} not within {resolved_source_dir}"
+        )
+
+    return resolved
+
+
 _COMPANION_LANGS = {
     "go": {"glob": "*.go", "is_test": lambda name: "_test.go" in name},
     "py": {"glob": "*.py", "is_test": lambda name: name.startswith("test_") or name.endswith("_test.py")},
@@ -1509,9 +1538,11 @@ def update_companion(
     """
     import yaml as _yaml
 
-    p = Path(file_path)
-    if not p.is_absolute():
-        p = SOURCE_DIR / file_path
+    try:
+        p = _resolve_within_source_dir(file_path)
+    except ValueError:
+        return {"success": False, "message": "path escapes SOURCE_DIR, refused"}
+
     if not p.exists():
         return {"success": False, "path": str(p), "message": "file not found"}
 
@@ -1607,6 +1638,11 @@ def record_decision(
             "node_id": node_id,
             "message": "companion file not found — provide companion_path explicitly",
         }
+
+    try:
+        p = _resolve_within_source_dir(str(p))
+    except ValueError:
+        return {"success": False, "message": "path escapes SOURCE_DIR, refused"}
 
     try:
         with p.open() as f:
