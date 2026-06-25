@@ -32,6 +32,24 @@ reinvented): cic-mcp-session/.mcp.json.tpl ("cic-session" entry):
     command: {REPO_ROOT}/.venv-host/bin/python
     args:    [{REPO_ROOT}/mcp-server/session_server.py]
     env:     {"PYTHONPATH": "{REPO_ROOT}"}
+
+Runtime-env unification (job: session-runtime-env-unification-001): the
+session-adapter's subprocess launch path (to_stdio_params() below) is
+adjusted here to resolve DB-config values via the SAME shared env-file
+convention session_store/runtime_env.py:load_session_env() defines in the
+cic-mcp-session repo (<session_repo_root>/session.env, or SESSION_ENV_FILE
+override), NOT just whatever this gateway PROCESS's own os.environ
+happens to contain — closing the drift where the worker loop, the session
+MCP server (in-process, when started directly), and this subprocess
+launch path could each resolve a different Postgres instance. This is a
+config-resolution change ONLY: no gateway query-API / business logic is
+touched (see input.md "Nem cél" for this job — that is
+gateway-query-context-api-001's scope, a separate job). The subprocess
+itself still reads its config via SessionStoreConfig.from_env() exactly as
+before (session_server.py's own load_session_env() call, see that
+module) — this dataclass only makes sure the RIGHT values end up in the
+subprocess's env in the first place, the same role
+StdioServerParameters.env already had before this job.
 """
 
 from __future__ import annotations
@@ -43,6 +61,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dotenv import dotenv_values
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -53,6 +72,11 @@ from mcp.client.stdio import stdio_client
 # env=None) — so these must be explicitly forwarded, or the subprocess
 # silently falls back to from_env()'s own defaults (localhost:5432/postgres)
 # instead of the actual test/dev Postgres instance the gateway is using.
+#
+# Same five key names as cic-mcp-session/session_store/envelope_writer.py:
+# SessionStoreConfig.from_env() and cic-mcp-session/session.env.example —
+# NOT reinvented here, see session-runtime-env-unification-001 report
+# "Decisions Proposed" for why a single DSN var was rejected.
 _SESSION_STORE_ENV_VARS = (
     "SESSION_STORE_PG_HOST",
     "SESSION_STORE_PG_PORT",
@@ -60,6 +84,49 @@ _SESSION_STORE_ENV_VARS = (
     "SESSION_STORE_PG_USER",
     "SESSION_STORE_PG_PASSWORD",
 )
+
+
+def _resolve_session_store_env(repo_root: Path) -> dict[str, str]:
+    """Resolve the five SESSION_STORE_PG_* values to forward into the
+    session_server.py subprocess's env, using the SAME precedence as
+    session_store.runtime_env.load_session_env() in the cic-mcp-session
+    repo (this gateway process does not import that module directly —
+    cic-mcp-session is a read-only dependency for this job, same stance as
+    session-context-pack-v1-001's own module docstring — so the file-
+    resolution logic is mirrored here, not imported):
+
+      1. This process's OWN os.environ (an explicit shell export/test
+         fixture override always wins — unchanged pre-this-job behavior).
+      2. SESSION_ENV_FILE, if set, naming an arbitrary env file.
+      3. <repo_root>/session.env, if it exists (repo_root is the
+         cic-mcp-session checkout passed to compile_context(), i.e. the
+         SAME checkout whose session.env a directly-launched worker_loop/
+         session_server.py would load — so pointing both the gateway and
+         a directly-run worker/server at one checkout's session.env makes
+         them see the same DB without any extra wiring).
+
+    Returns only the keys that resolved to a non-None value — callers must
+    still treat an empty dict as "nothing to forward" (subprocess falls
+    back to from_env()'s own defaults), exactly as before this job.
+    """
+    resolved: dict[str, str] = {}
+
+    file_values: dict[str, str | None] = {}
+    env_file_override = os.environ.get("SESSION_ENV_FILE")
+    candidate_path = (
+        Path(env_file_override) if env_file_override else (repo_root / "session.env")
+    )
+    if candidate_path.is_file():
+        file_values = dotenv_values(candidate_path)
+
+    for var in _SESSION_STORE_ENV_VARS:
+        value = os.environ.get(var)
+        if value is None:
+            value = file_values.get(var)
+        if value is not None:
+            resolved[var] = value
+
+    return resolved
 
 SOURCE_ID_SESSION = "cic-mcp-session"
 TRUST_DOMAIN_SESSION_LOCAL = "session_local"
@@ -90,10 +157,7 @@ class SessionServerLaunchConfig:
         python_exe = self.python_executable or (repo_root_abs / ".venv-host" / "bin" / "python")
         server_script = repo_root_abs / "mcp-server" / "session_server.py"
         env = {"PYTHONPATH": str(repo_root_abs)}
-        for var in _SESSION_STORE_ENV_VARS:
-            value = os.environ.get(var)
-            if value is not None:
-                env[var] = value
+        env.update(_resolve_session_store_env(repo_root_abs))
         return StdioServerParameters(
             command=str(python_exe),
             args=[str(server_script)],
