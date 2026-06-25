@@ -26,6 +26,10 @@ pytest-mock
 pytest-cov
 psycopg[binary]
 
+# Shared runtime env-file loader for the session-adapter subprocess launch
+# path (session-runtime-env-unification-001)
+python-dotenv
+
 # Linting and Formatting
 ruff
 black
