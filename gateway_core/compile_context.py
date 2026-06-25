@@ -149,10 +149,97 @@ def _empty_per_category(overrides: dict[str, str] | None = None) -> dict[str, st
     return base
 
 
+def _classify_intent(query: str) -> str:
+    """Minimal, RULE-BASED (NOT ML) intent classifier for a free-text
+    `query`, per job input.md "Feladat" 2 ("legalább egy egyszerű,
+    kulcsszó- vagy szabály-alapú osztályozás elfogadható, nem kell ML")
+    and "Nem cél" ("valódi ML-alapú intent-klasszifikáció" is out of
+    scope).
+
+    Returns one of the GatewayContextEnvelope.query_intent free-text
+    values already in use by this module ("session-context-recall" — see
+    _build_envelope) or a new "session-query-search" value for the
+    query-driven path added by this job. This is intentionally coarse: a
+    future gateway-query-intent-taxonomy job (see schema.yaml query_intent
+    docstring) may replace this with a real taxonomy/enum.
+    """
+    lowered = query.lower()
+    timeline_keywords = ("history", "timeline", "when did", "order of", "sequence")
+    if any(keyword in lowered for keyword in timeline_keywords):
+        return "session-history-recall"
+    return "session-query-search"
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough, deterministic token-count estimate (chars / 4 — a common
+    coarse heuristic for English/code-like text, e.g. OpenAI's own
+    "~4 chars per token" rule of thumb). This is NOT a real tokenizer —
+    job input.md "Feladat" 2 only requires token_budget enforcement
+    "becsült karakter/token-szám alapján" (estimated char/token count),
+    not exact tokenizer parity. Always >= 1 for non-empty text so a
+    single short note cannot be estimated as free.
+    """
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def _apply_token_budget(
+    status_notes: list[dict[str, Any]],
+    chunk_notes: list[dict[str, Any]],
+    refs: list[dict[str, Any]],
+    token_budget: int | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Truncate `chunk_notes` (and the matching `refs` entries) so the
+    estimated total token count of ALL returned notes (status_notes +
+    kept chunk_notes) stays within `token_budget`.
+
+    `status_notes` (the get_session_status() summary note, always exactly
+    one entry in this module) are NEVER truncated — they are the
+    session-identity anchor of the envelope, not query-relevant content,
+    and are cheap (one fixed-shape sentence). Truncation only ever
+    removes CHUNK content, starting from the LEAST relevant (chunk_notes
+    is assumed already ordered most-relevant-first by the caller, mirrors
+    search_session_context()'s own fused_score DESC order) — this is why
+    the budget check happens AFTER the most-relevant-first sort, not
+    before. The single most relevant chunk note is always kept even if it
+    alone exceeds the remaining budget, so a too-small budget never
+    silently drops to zero relevant content for a query that genuinely
+    matched something (see Forbidden Shortcuts: token_budget that is
+    accepted but never enforced — this is the inverse failure mode, an
+    enforcement so aggressive it defeats the query path's own purpose).
+    If `token_budget` is None, returns inputs unchanged (no enforcement
+    requested — existing session_id-only callers never pass this, so
+    their behavior is untouched).
+    """
+    if token_budget is None:
+        return status_notes + chunk_notes, refs
+
+    used_tokens = sum(_estimate_tokens(n["content"]) for n in status_notes)
+    kept_chunk_notes: list[dict[str, Any]] = []
+    for note in chunk_notes:
+        cost = _estimate_tokens(note["content"])
+        if kept_chunk_notes and used_tokens + cost > token_budget:
+            # Budget exhausted — stop, do not include this or any later
+            # (lower-relevance) chunk note.
+            break
+        kept_chunk_notes.append(note)
+        used_tokens += cost
+
+    kept_notes = status_notes + kept_chunk_notes
+    kept_ref_ids = {n["ref"] for n in kept_notes}
+    kept_refs = [ref for ref in refs if ref["ref_id"] in kept_ref_ids]
+
+    return kept_notes, kept_refs
+
+
 async def _compile_context_async(
     session_id: str,
     launch_config: SessionServerLaunchConfig,
     max_chunks: int = 50,
+    query: str | None = None,
+    intent: str | None = None,
+    token_budget: int | None = None,
 ) -> dict[str, Any]:
     """Async implementation — does the REAL subprocess + stdio handshake.
 
@@ -228,7 +315,67 @@ async def _compile_context_async(
                 }
             )
 
-            # --- Adapter contract step 2: content tool, query_intent =
+            if query is not None:
+                # --- NEW query-driven path (gateway-query-context-api-001) ---
+                # Use the hybrid (FTS + vector, RRF-fused) search tool —
+                # search_session_context() — so the returned notes are
+                # RANKED BY RELEVANCE to `query`, not "first N chunks in
+                # sequence" like get_session_context_pack() below. This is
+                # the "forrás-kiválasztás...a query alapján" requirement in
+                # input.md "Feladat" 2.
+                resolved_intent = intent or _classify_intent(query)
+                search_result = await session.call_tool(
+                    "search_session_context",
+                    {"session_id": session_id, "query": query, "limit": max_chunks},
+                )
+                search_rows = _extract_tool_list(search_result)
+
+                sources_used.append(
+                    {
+                        "source_id": SOURCE_ID_SESSION,
+                        "trust_domain": TRUST_DOMAIN_SESSION_LOCAL,
+                        "query_capability_used": "hybrid_search",
+                    }
+                )
+
+                # session_derived_notes so far is just the status-summary
+                # note (added above, before this branch) — keep it apart
+                # from the new chunk notes so _apply_token_budget() can
+                # exempt the status note from truncation (see its
+                # docstring) while still truncating chunk content by
+                # relevance order (search_session_context()'s own
+                # fused_score DESC order, NOT re-sorted here).
+                status_notes = list(session_derived_notes)
+                chunk_notes: list[dict[str, Any]] = []
+                for row in search_rows:
+                    chunk_notes.append(_context_pack_note(row, session_id))
+                    refs.append(
+                        {
+                            "ref_id": f"session:{session_id}:chunk:{row['chunk_id']}",
+                            "source_id": SOURCE_ID_SESSION,
+                            "excerpt": row["text"][:200],
+                        }
+                    )
+
+                session_derived_notes, refs = _apply_token_budget(
+                    status_notes, chunk_notes, refs, token_budget
+                )
+
+                per_category = "medium" if len(session_derived_notes) > 1 else "not_used"
+                envelope = _build_envelope(
+                    session_id=session_id,
+                    answer_type="history_recall" if search_rows else "status_summary",
+                    sources_used=sources_used,
+                    session_derived_notes=session_derived_notes,
+                    refs=refs,
+                    proof_requirements=[],
+                    per_category_overrides={"session_derived_notes": per_category},
+                )
+                envelope["query_intent"] = resolved_intent
+                return envelope
+
+            # --- EXISTING path (session-context-pack-v1-001), UNCHANGED:
+            # Adapter contract step 2: content tool, query_intent =
             # "session-context-recall" -> get_session_context_pack() ---
             pack_result = await session.call_tool(
                 "get_session_context_pack",
@@ -356,8 +503,22 @@ def compile_context(
     repo_root: Path | str,
     max_chunks: int = 50,
     python_executable: Path | str | None = None,
+    query: str | None = None,
+    intent: str | None = None,
+    repo: str | None = None,
+    token_budget: int | None = None,
 ) -> dict[str, Any]:
     """Public, synchronous entry point.
+
+    Job gateway-query-context-api-001 added `query`/`intent`/`repo`/
+    `token_budget` (all keyword-only-by-convention, default None) on top
+    of the session-context-pack-v1-001 signature below. `session_id` and
+    `repo_root` remain POSITIONAL-OR-KEYWORD and required, UNCHANGED, so
+    every existing call site (session_id-only path) keeps working exactly
+    as before — see this function's "Existing path" branch and
+    tests/test_gateway_core/test_compile_context.py's two end-to-end
+    tests, which exercise that path with NO new arguments and assert
+    byte-for-byte the same envelope shape as before this job.
 
     Args:
         session_id: the cic-mcp-session session_core.sessions.session_id
@@ -366,11 +527,42 @@ def compile_context(
         repo_root: path to a cic-mcp-session checkout — used to locate
             .venv-host/bin/python and mcp-server/session_server.py, exactly
             mirroring cic-mcp-session/.mcp.json.tpl's "cic-session" entry.
-        max_chunks: passed through to get_session_context_pack() (default
-            mirrors the tool's own default, mcp-server/session_server.py:303).
+        max_chunks: passed through to get_session_context_pack() (existing
+            path) or as the `limit` of search_session_context() (new
+            query path); default mirrors the tool's own default,
+            mcp-server/session_server.py:303).
         python_executable: override for the interpreter used to launch the
             session server subprocess (defaults to
             {repo_root}/.venv-host/bin/python).
+        query: NEW (gateway-query-context-api-001). Free-text question. If
+            None (default), behavior is UNCHANGED from before this job —
+            the existing session_id-only get_session_context_pack() path
+            runs. If given, a NEW path runs instead: cic-mcp-session's
+            REAL search_session_context() (hybrid FTS+vector, RRF-fused)
+            tool is queried, so session_derived_notes[] contains chunks
+            RANKED BY RELEVANCE to `query`, not "first N chunks in
+            sequence". `session_id` is still REQUIRED in this path (this
+            job keeps scope_kind="session" — cross-session/global query
+            scope is out of scope here, see "Decisions Proposed" in
+            output/gateway-query-context-api.md).
+        intent: NEW. Optional override for the envelope's `query_intent`
+            field when `query` is given. If None, a simple rule-based
+            classifier (_classify_intent()) derives it from `query` —
+            NOT an ML classifier (explicitly out of scope, see job
+            input.md "Nem cél"). Ignored when `query` is None (the
+            existing path always sets query_intent="session-context-
+            recall", unchanged).
+        repo: NEW, accepted but NOT YET wired to any source in this job
+            (see output/gateway-query-context-api.md "Rejected / Out Of
+            Scope" — workdir/repo-scoped sources are a separate,
+            not-yet-implemented capability). Reserved for a future
+            scope_kind="repo" path.
+        token_budget: NEW. Optional estimated-token ceiling for the
+            returned envelope's session_derived_notes[] (and the matching
+            refs[] entries). Only enforced on the NEW query path (`query`
+            is not None) — see _apply_token_budget(). None (default)
+            means no enforcement, matching the existing path's behavior
+            exactly (it never truncates).
 
     Returns:
         dict: a GatewayContextEnvelope, schema-valid against
@@ -383,5 +575,12 @@ def compile_context(
         python_executable=Path(python_executable) if python_executable else None,
     )
     return asyncio.run(
-        _compile_context_async(session_id, launch_config, max_chunks=max_chunks)
+        _compile_context_async(
+            session_id,
+            launch_config,
+            max_chunks=max_chunks,
+            query=query,
+            intent=intent,
+            token_budget=token_budget,
+        )
     )

@@ -187,6 +187,64 @@ def seeded_session_id(pg_config) -> str:
             return str(row[0])
 
 
+@pytest.fixture
+def query_seeded_session_id(pg_config) -> str:
+    """Like seeded_session_id, but with topically DISTINCT turns, so a
+    free-text query can plausibly rank one chunk above the others — used
+    by the NEW query-driven path tests (gateway-query-context-api-001
+    "Feladat" 4 + 5). Reusing the generic 2-turn fixture above would make
+    "is the returned content actually RELEVANT to the query, not just the
+    first N chunks" unverifiable, since both turns are near-identical
+    pytest boilerplate text.
+    """
+    from session_store.chunk_indexer import run_indexing_batch
+    from session_store.envelope_writer import insert_envelope
+    from session_store.turn_projector import run_projection_batch
+
+    provider_session_id = f"gateway-pytest-query-{uuid.uuid4().hex[:8]}"
+    base_time = datetime(2026, 6, 22, 14, 0, 0, tzinfo=timezone.utc)
+    turns = [
+        ("Stop", "User: what is the deployment rollback procedure for the gateway service?"),
+        (
+            "AssistantMessage",
+            "Assistant: to roll back the gateway deployment, run the release-close "
+            "script with the previous version tag, then verify the health endpoint "
+            "returns 200 before declaring the rollback complete.",
+        ),
+        ("Stop", "User: what's your favorite color for the dashboard theme?"),
+        (
+            "AssistantMessage",
+            "Assistant: I'd suggest a dark blue theme for the dashboard, it tends to "
+            "be easier on the eyes for long monitoring sessions.",
+        ),
+    ]
+    for i, (event_name, text) in enumerate(turns):
+        envelope = _valid_envelope(
+            event_id=str(uuid.uuid4()),
+            provider_session_id=provider_session_id,
+            provider_event_name=event_name,
+            occurred_at=base_time + timedelta(minutes=i),
+            ingested_at=base_time + timedelta(minutes=i, seconds=1),
+            payload={"raw_text": text},
+            idempotency_key="sha256:" + uuid.uuid4().hex + uuid.uuid4().hex[:32],
+        )
+        insert_envelope(envelope, config=pg_config)
+        run_projection_batch(config=pg_config)
+        run_indexing_batch(config=pg_config)
+
+    import psycopg
+
+    with psycopg.connect(pg_config.conninfo()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT session_id FROM session_core.sessions WHERE provider_session_id = %s",
+                (provider_session_id,),
+            )
+            row = cur.fetchone()
+            assert row is not None, "real pipeline did not produce a session_core.sessions row"
+            return str(row[0])
+
+
 def test_compile_context_available_session_end_to_end(session_repo_root, seeded_session_id):
     """Full real path: real DB data (seeded via the real pipeline) + real
     subprocess + real stdio MCP handshake + schema-valid envelope.
@@ -240,6 +298,126 @@ def test_compile_context_unavailable_session_end_to_end(session_repo_root, pg_co
     assert nonexistent_session_id in envelope["proof_requirements"][0]["description"]
     assert envelope["trust_summary"]["per_category"]["session_derived_notes"] == "unverified"
 
+
+def test_compile_context_query_path_returns_relevant_chunk(
+    session_repo_root, query_seeded_session_id
+):
+    """NEW query-driven path (gateway-query-context-api-001 "Feladat" 4):
+    compile_context(query=...) must return session_derived_notes[] that
+    are RELEVANT to the query — i.e. the rollback-procedure chunk should
+    rank ABOVE the unrelated dashboard-color chunk — not just "the first
+    N chunks in insertion order" (which is what the EXISTING
+    get_session_context_pack() path returns, and which this new path is
+    explicitly required NOT to reduce to, per input.md "Feladat" 2).
+    """
+    from gateway_core.compile_context import compile_context
+    from gateway_core.validate_envelope import validate_envelope_file
+
+    query = "how do I roll back a deployment"
+    envelope = compile_context(
+        query_seeded_session_id,
+        repo_root=session_repo_root,
+        query=query,
+    )
+
+    assert envelope["kind"] == "GatewayContextEnvelope"
+    assert envelope["scope"]["session_id"] == query_seeded_session_id
+    # query_intent must reflect the NEW path, not the unchanged
+    # "session-context-recall" value the existing path always sets.
+    assert envelope["query_intent"] != "session-context-recall"
+
+    chunk_notes = [n for n in envelope["session_derived_notes"] if ":chunk:" in n["ref"]]
+    assert len(chunk_notes) >= 1, "query path returned zero chunk-derived notes"
+
+    # The TOP-ranked chunk note (first in the list — search_session_context()
+    # already orders by fused_score DESC) must be about the rollback
+    # procedure, NOT the unrelated dashboard-color turn. This is the
+    # concrete, real-data proof that relevance-ranking (not insertion
+    # order) drove the selection.
+    top_content = chunk_notes[0]["content"].lower()
+    assert "rollback" in top_content or "roll back" in top_content, (
+        f"expected the top-ranked note to be about rollback, got: {top_content!r}"
+    )
+    assert "dashboard" not in top_content and "color" not in top_content, (
+        f"top-ranked note should not be the unrelated dashboard/color turn, got: {top_content!r}"
+    )
+
     schema_path = GATEWAY_REPO_ROOT / "output" / "gateway-context-envelope.schema.yaml"
     checks = validate_envelope_file(envelope, schema_path)
     assert len(checks) > 0
+
+
+def test_compile_context_query_path_session_id_only_path_unaffected(
+    session_repo_root, query_seeded_session_id
+):
+    """Sanity check that the SAME seeded session, when queried WITHOUT
+    `query` (the existing path), still returns the existing
+    "session-context-recall" query_intent and ALL chunks in insertion
+    order (get_session_context_pack() behavior) — i.e. the new fixture
+    does not accidentally change old-path behavior either.
+    """
+    from gateway_core.compile_context import compile_context
+
+    envelope = compile_context(query_seeded_session_id, repo_root=session_repo_root)
+
+    assert envelope["query_intent"] == "session-context-recall"
+    chunk_notes = [n for n in envelope["session_derived_notes"] if ":chunk:" in n["ref"]]
+    assert len(chunk_notes) == 4, "existing path must return ALL chunks, not a relevance subset"
+
+
+def test_compile_context_token_budget_truncates_envelope(
+    session_repo_root, query_seeded_session_id
+):
+    """token_budget enforcement (gateway-query-context-api-001 "Feladat" 5):
+    the SAME query against the SAME session must produce a strictly
+    SMALLER (estimated-token) envelope when a small token_budget is given,
+    compared to a large/unbounded token_budget — proving token_budget is
+    actually enforced, not just accepted and ignored (Forbidden Shortcuts
+    explicitly bans the latter).
+    """
+    from gateway_core.compile_context import compile_context
+
+    query = "how do I roll back a deployment"
+
+    small_envelope = compile_context(
+        query_seeded_session_id,
+        repo_root=session_repo_root,
+        query=query,
+        token_budget=20,
+    )
+    large_envelope = compile_context(
+        query_seeded_session_id,
+        repo_root=session_repo_root,
+        query=query,
+        token_budget=100_000,
+    )
+
+    small_notes = small_envelope["session_derived_notes"]
+    large_notes = large_envelope["session_derived_notes"]
+
+    small_chars = sum(len(n["content"]) for n in small_notes)
+    large_chars = sum(len(n["content"]) for n in large_notes)
+
+    assert len(small_notes) <= len(large_notes), (
+        f"small token_budget produced MORE notes ({len(small_notes)}) than the "
+        f"large budget ({len(large_notes)}) — token_budget is not constraining output"
+    )
+    assert small_chars < large_chars, (
+        f"small token_budget envelope ({small_chars} chars) is not smaller than the "
+        f"large token_budget envelope ({large_chars} chars) — token_budget had no effect"
+    )
+    # The top-ranked (most relevant) note must still be present in the
+    # small-budget result — truncation must drop LOW-relevance content
+    # first, never silently produce an empty/irrelevant result.
+    assert any(
+        "rollback" in n["content"].lower() or "roll back" in n["content"].lower()
+        for n in small_notes
+    ), "small token_budget dropped the single most relevant note entirely"
+
+    # Both envelopes (truncated and not) must still be schema-valid —
+    # token_budget enforcement must not produce a malformed envelope.
+    from gateway_core.validate_envelope import validate_envelope_file
+
+    schema_path = GATEWAY_REPO_ROOT / "output" / "gateway-context-envelope.schema.yaml"
+    assert len(validate_envelope_file(small_envelope, schema_path)) > 0
+    assert len(validate_envelope_file(large_envelope, schema_path)) > 0
