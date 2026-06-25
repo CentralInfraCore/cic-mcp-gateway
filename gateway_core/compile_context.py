@@ -65,6 +65,24 @@ from dotenv import dotenv_values
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# gateway-knowledge-shared-adapters-001: the cic-mcp-knowledge (canonical)
+# and cic-mcp-shared (cross-session) source adapters. Both default to
+# "not queried" in compile_context() (their launch/db config is None unless
+# a caller opts in), so the session-only call sites are byte-for-byte
+# unchanged.
+from gateway_core.knowledge_adapter import (
+    SOURCE_ID_KNOWLEDGE,
+    TRUST_DOMAIN_KNOWLEDGE_CANONICAL,
+    KnowledgeServerLaunchConfig,
+    search_knowledge,
+)
+from gateway_core.shared_adapter import (
+    SOURCE_ID_SHARED,
+    TRUST_DOMAIN_SHARED,
+    SharedDbConfig,
+    search_shared_candidates,
+)
+
 # The cic-mcp-session subprocess reads its DB connection params from these
 # env vars (session_store/envelope_writer.py:SessionStoreConfig.from_env()).
 # StdioServerParameters.env, when set, REPLACES the subprocess environment
@@ -297,6 +315,98 @@ def _apply_token_budget(
     return kept_notes, kept_refs
 
 
+def _shared_per_category(shared_memory_notes: list[dict[str, Any]]) -> str:
+    """Per-category confidence for shared_memory_notes, derived from the
+    PRESERVED row trust (never upgraded): a reviewed_shared row lifts the
+    category to "medium"; candidate-only stays "low"; empty -> "not_used".
+    (Shared content is "not canonical by default" — it never reaches "high"
+    here, which is reserved for canonical_facts.)
+    """
+    if not shared_memory_notes:
+        return "not_used"
+    if any(note.get("trust") == "reviewed_shared" for note in shared_memory_notes):
+        return "medium"
+    return "low"
+
+
+async def _gather_multi_source(
+    *,
+    query: str,
+    knowledge_launch: KnowledgeServerLaunchConfig | None,
+    shared_config: SharedDbConfig | None,
+    knowledge_top_k: int,
+    shared_limit: int,
+    sources_used: list[dict[str, Any]],
+    refs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Query the opted-in knowledge/shared sources for `query` and return
+    (canonical_facts, shared_memory_notes) shaped EXACTLY as the envelope
+    schema requires (canonical_facts items: {content, ref} only — no trust;
+    shared_memory_notes items: {content, trust, ref}).
+
+    Side effects: appends one sources_used[] entry per consulted source
+    (recording it was queried, regardless of hit count) and one refs[] entry
+    per emitted item (provenance for the envelope ref pointers). A source
+    that returns zero rows is still recorded in sources_used[] — "queried,
+    no hit" is auditable, mirroring the session adapter's
+    "record-even-on-negative" stance.
+    """
+    canonical_facts: list[dict[str, Any]] = []
+    shared_memory_notes: list[dict[str, Any]] = []
+
+    if knowledge_launch is not None:
+        knowledge_hits = await search_knowledge(
+            knowledge_launch, query, top_k=knowledge_top_k
+        )
+        sources_used.append(
+            {
+                "source_id": SOURCE_ID_KNOWLEDGE,
+                "trust_domain": TRUST_DOMAIN_KNOWLEDGE_CANONICAL,
+                "query_capability_used": "search_query",
+            }
+        )
+        for hit in knowledge_hits:
+            # Envelope canonical_facts items carry ONLY {content, ref} — the
+            # absence of a trust field IS the canonical marking.
+            canonical_facts.append({"content": hit["content"], "ref": hit["ref"]})
+            refs.append(
+                {
+                    "ref_id": hit["ref"],
+                    "source_id": SOURCE_ID_KNOWLEDGE,
+                    "excerpt": hit["content"][:200],
+                }
+            )
+
+    if shared_config is not None:
+        shared_rows = search_shared_candidates(shared_config, query, limit=shared_limit)
+        sources_used.append(
+            {
+                "source_id": SOURCE_ID_SHARED,
+                "trust_domain": TRUST_DOMAIN_SHARED,
+                "query_capability_used": "candidates_read",
+            }
+        )
+        for row in shared_rows:
+            # row.trust is PRESERVED verbatim (candidate|reviewed_shared) —
+            # mixed was already excluded by the adapter, never upgraded here.
+            shared_memory_notes.append(
+                {
+                    "content": row["content"],
+                    "trust": row["trust"],
+                    "ref": row["ref"],
+                }
+            )
+            refs.append(
+                {
+                    "ref_id": row["ref"],
+                    "source_id": SOURCE_ID_SHARED,
+                    "excerpt": row["content"][:200],
+                }
+            )
+
+    return canonical_facts, shared_memory_notes
+
+
 async def _compile_context_async(
     session_id: str,
     launch_config: SessionServerLaunchConfig,
@@ -304,6 +414,10 @@ async def _compile_context_async(
     query: str | None = None,
     intent: str | None = None,
     token_budget: int | None = None,
+    knowledge_launch: KnowledgeServerLaunchConfig | None = None,
+    shared_config: SharedDbConfig | None = None,
+    knowledge_top_k: int = 5,
+    shared_limit: int = 10,
 ) -> dict[str, Any]:
     """Async implementation — does the REAL subprocess + stdio handshake.
 
@@ -425,7 +539,31 @@ async def _compile_context_async(
                     status_notes, chunk_notes, refs, token_budget
                 )
 
-                per_category = "medium" if len(session_derived_notes) > 1 else "not_used"
+                # --- gateway-knowledge-shared-adapters-001: multi-source ---
+                # Only on this query path, and only for the sources the
+                # caller opted into (knowledge_launch / shared_config not
+                # None). Each source's content keeps ITS OWN trust marking:
+                # knowledge -> canonical_facts[] (no trust field = canonical),
+                # shared -> shared_memory_notes[] (row.trust verbatim,
+                # candidate|reviewed_shared, mixed already excluded by the
+                # adapter). The gateway never upgrades trust here.
+                canonical_facts, shared_memory_notes = await _gather_multi_source(
+                    query=query,
+                    knowledge_launch=knowledge_launch,
+                    shared_config=shared_config,
+                    knowledge_top_k=knowledge_top_k,
+                    shared_limit=shared_limit,
+                    sources_used=sources_used,
+                    refs=refs,
+                )
+
+                overrides = {
+                    "session_derived_notes": (
+                        "medium" if len(session_derived_notes) > 1 else "not_used"
+                    ),
+                    "canonical_facts": "high" if canonical_facts else "not_used",
+                    "shared_memory_notes": _shared_per_category(shared_memory_notes),
+                }
                 envelope = _build_envelope(
                     session_id=session_id,
                     answer_type="history_recall" if search_rows else "status_summary",
@@ -433,7 +571,9 @@ async def _compile_context_async(
                     session_derived_notes=session_derived_notes,
                     refs=refs,
                     proof_requirements=[],
-                    per_category_overrides={"session_derived_notes": per_category},
+                    per_category_overrides=overrides,
+                    canonical_facts=canonical_facts,
+                    shared_memory_notes=shared_memory_notes,
                 )
                 envelope["query_intent"] = resolved_intent
                 return envelope
@@ -529,16 +669,41 @@ def _build_envelope(
     refs: list[dict[str, Any]],
     proof_requirements: list[dict[str, Any]],
     per_category_overrides: dict[str, str],
+    canonical_facts: list[dict[str, Any]] | None = None,
+    shared_memory_notes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Assemble a full GatewayContextEnvelope dict, schema-valid against
     output/gateway-context-envelope.schema.yaml (all 16 required top-level
-    fields present; canonical_facts/workdir_facts/shared_memory_notes/
-    conflicts are always [] in this implementation, per "Nem cél" — only
-    the cic-mcp-session source is wired).
+    fields present).
+
+    canonical_facts (cic-mcp-knowledge) and shared_memory_notes
+    (cic-mcp-shared) were wired by gateway-knowledge-shared-adapters-001;
+    they default to [] so every pre-existing call site (session-only path,
+    and the unavailable-session early return) emits exactly the same empty
+    arrays as before that job. workdir_facts/conflicts remain always [] (no
+    workdir source / conflict detector is wired yet — out of scope).
+
+    overall_confidence is DERIVED from what content is actually present
+    (schema requires it be derivable from per_category): canonical content
+    present -> "high"; else any session/shared content -> "medium"; an
+    explicit "unverified" session override (unavailable session) with no
+    canonical/shared content stays "unverified" — unchanged from before
+    this job for the session-only paths.
     """
-    overall = "unverified" if per_category_overrides.get("session_derived_notes") == "unverified" else (
-        "medium" if session_derived_notes else "unverified"
-    )
+    canonical_facts = canonical_facts or []
+    shared_memory_notes = shared_memory_notes or []
+
+    if canonical_facts:
+        overall = "high"
+    elif (
+        per_category_overrides.get("session_derived_notes") == "unverified"
+        and not shared_memory_notes
+    ):
+        overall = "unverified"
+    elif session_derived_notes or shared_memory_notes:
+        overall = "medium"
+    else:
+        overall = "unverified"
     return {
         "apiVersion": "cic.gateway/v1",
         "kind": "GatewayContextEnvelope",
@@ -552,10 +717,10 @@ def _build_envelope(
             "overall_confidence": overall,
             "per_category": _empty_per_category(per_category_overrides),
         },
-        "canonical_facts": [],
+        "canonical_facts": canonical_facts,
         "workdir_facts": [],
         "session_derived_notes": session_derived_notes,
-        "shared_memory_notes": [],
+        "shared_memory_notes": shared_memory_notes,
         "conflicts": [],
         "proof_requirements": proof_requirements,
         "refs": refs,
@@ -571,6 +736,12 @@ def compile_context(
     intent: str | None = None,
     repo: str | None = None,
     token_budget: int | None = None,
+    knowledge_repo_root: Path | str | None = None,
+    knowledge_python_executable: Path | str | None = None,
+    knowledge_kb_data_dir: Path | str | None = None,
+    shared_db_config: SharedDbConfig | None = None,
+    knowledge_top_k: int = 5,
+    shared_limit: int = 10,
 ) -> dict[str, Any]:
     """Public, synchronous entry point.
 
@@ -638,6 +809,30 @@ def compile_context(
         repo_root=Path(repo_root),
         python_executable=Path(python_executable) if python_executable else None,
     )
+
+    # gateway-knowledge-shared-adapters-001: build the knowledge launch
+    # config ONLY if a caller passed knowledge_repo_root (else None -> the
+    # query path does not consult cic-mcp-knowledge, unchanged behavior).
+    # shared is opted into via an explicit SharedDbConfig (the gateway does
+    # not guess a DB; the caller supplies SharedDbConfig.from_env() or an
+    # explicit config). Both are ignored on the session-only path (query is
+    # None) — only _compile_context_async's query branch reads them.
+    knowledge_launch = (
+        KnowledgeServerLaunchConfig(
+            repo_root=Path(knowledge_repo_root),
+            python_executable=(
+                Path(knowledge_python_executable)
+                if knowledge_python_executable
+                else None
+            ),
+            kb_data_dir=(
+                Path(knowledge_kb_data_dir) if knowledge_kb_data_dir else None
+            ),
+        )
+        if knowledge_repo_root
+        else None
+    )
+
     return asyncio.run(
         _compile_context_async(
             session_id,
@@ -646,5 +841,9 @@ def compile_context(
             query=query,
             intent=intent,
             token_budget=token_budget,
+            knowledge_launch=knowledge_launch,
+            shared_config=shared_db_config,
+            knowledge_top_k=knowledge_top_k,
+            shared_limit=shared_limit,
         )
     )
