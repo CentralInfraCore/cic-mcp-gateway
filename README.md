@@ -28,8 +28,21 @@ A komponensek közti pontos határt lásd: [CLAUDE.md](CLAUDE.md).
 ## Státusz
 
 `experimental` — a repo a `cic-mcp-factory` job-lifecycle-én keresztül épül fel, kapacitás-jobonként.
-Jelenleg a `base-repo` `mcp/main` template-jéből bootstrapelt MCP-szerver scaffold van benne,
-saját gateway-specifikus implementáció (`GatewayContextEnvelope`, source registry) még nincs.
+
+**Implementált (`implemented`):**
+- `gateway_core/compile_context.py` — `compile_context()`: valódi session-source context compiler,
+  subprocess-alapú MCP klienssel hívja a `cic-mcp-session` szervert, `GatewayContextEnvelope`-kompatibilis
+  kimenetet állít elő
+- `gateway_core/validate_envelope.py` — envelope schema validáció
+- `mcp-server/gateway_server.py` — `get_gateway_context_pack` MCP tool (`session_id`, `session_repo_root`,
+  `max_chunks`)
+- Signed contracts: source registry schema, session adapter contract, context envelope schema (`output/`)
+
+**Scaffold (kód van, de nincs bekötve):**
+- knowledge / shared / workdir forrás-bekötés — `compile_context.py` explicit scope-on kívül hagyja,
+  a mezők `[]` / `"not_used"` értékkel schema-validak de tartalommal üresek
+- multi-source query intent routing — stub mezők az envelope-ban
+- `source/` üres (a base-repo KB szerver ez alapján épít — gateway kontextusban nem használt)
 
 ## Kapcsolódó dokumentáció
 
