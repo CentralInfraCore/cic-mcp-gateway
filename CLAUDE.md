@@ -46,11 +46,19 @@ Tiltott rövidítések:
 
 ## Jelenlegi állapot
 
-`experimental`, nincs még gateway-specifikus implementáció — a `make_source.py`/`mcp-server/`
-scaffold a `base-repo` MCP-template öröksége, `source/` üres. Az első capability-jobok
-(`gateway-repo-baseline-or-bootstrap-001` — ezzel a bootstrap-pal lezárva,
-`gateway-context-envelope-contract-001`, `gateway-session-adapter-contract-001`) a
-`cic-mcp-factory/jobs/` alól indulnak.
+`experimental` — gateway-specifikus implementáció létezik, az alábbi státuszokkal:
+
+| Komponens | Státusz | Megjegyzés |
+|---|---|---|
+| `gateway_core/compile_context.py` | **implemented** | `compile_context()`: session-source compiler, subprocess MCP kliens |
+| `gateway_core/validate_envelope.py` | **implemented** | envelope schema validáció |
+| `mcp-server/gateway_server.py` | **implemented** | `get_gateway_context_pack` MCP tool |
+| knowledge/shared/workdir source wiring | **scaffold** | mezők emittálva, tartalom üres — explicit scope határon kívül |
+| multi-source query intent routing | **scaffold** | stub mezők az envelope-ban |
+| `mcp-server/server.py` (base-repo KB) | scaffold | base-repo MCP-template öröksége, gateway kontextusban nem aktív |
+
+A `source/` könyvtár üres — a base-repo FastMCP KB szerver (`mcp-server/server.py`) gateway
+kontextusban nem használt. Az aktív gateway-specifikus MCP tool: `gateway_server.py`.
 
 ## MCP szerver
 
