@@ -50,11 +50,12 @@ Tiltott rövidítések:
 
 | Komponens | Státusz | Megjegyzés |
 |---|---|---|
-| `gateway_core/compile_context.py` | **implemented** | `compile_context()`: session-source compiler, subprocess MCP kliens |
+| `gateway_core/compile_context.py` | **implemented** | `compile_context()`: session + knowledge + shared compiler, subprocess MCP kliens |
 | `gateway_core/validate_envelope.py` | **implemented** | envelope schema validáció |
+| `gateway_core/knowledge_adapter.py` | **implemented** | `search_knowledge()`: subprocess MCP kliens cic-mcp-knowledge-hez |
+| `gateway_core/shared_adapter.py` | **implemented** | `search_shared_candidates()`: SQLite reader shared DB-hez |
 | `mcp-server/gateway_server.py` | **implemented** | `get_gateway_context_pack` MCP tool |
-| knowledge/shared/workdir source wiring | **scaffold** | mezők emittálva, tartalom üres — explicit scope határon kívül |
-| multi-source query intent routing | **scaffold** | stub mezők az envelope-ban |
+| workdir source wiring | **scaffold** | `workdir_facts` mindig `[]` — explicit scope határon kívül |
 | `mcp-server/server.py` (base-repo KB) | scaffold | base-repo MCP-template öröksége, gateway kontextusban nem aktív |
 
 A `source/` könyvtár üres — a base-repo FastMCP KB szerver (`mcp-server/server.py`) gateway
